@@ -1,0 +1,23 @@
+# Database (contains your real dog data)
+pawfolio.db
+
+# Photos (your personal dog photos)
+photos/*
+!photos/.gitkeep
+
+# Environment / secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Claude Code local settings (machine-specific, not project code)
+.claude/settings.local.json
