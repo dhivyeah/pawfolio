@@ -152,10 +152,104 @@ def show_tag_pills(tags_str: str, empty_msg: str = "—"):
 _ADD_NEW_VET_OPTION = "➕ Add a new vet..."
 
 
+def queue_toast(message: str, icon: str = "✅"):
+    """Queue a toast to fire on the *next* script run. st.toast() called immediately
+    before st.rerun() never reaches the browser — the rerun cuts the run off before the
+    message is flushed to the frontend, so the confirmation silently never appears. This
+    stashes the message instead; render_queued_toast() (called once at page top level)
+    fires it on the fresh run that follows the rerun, where it displays normally."""
+    st.session_state["_toast_queue"] = (message, icon)
+
+
+def render_queued_toast():
+    """Call once near the top of a page to fire a toast queued by queue_toast()."""
+    queued = st.session_state.get("_toast_queue")
+    if queued:
+        st.session_state["_toast_queue"] = None
+        st.toast(queued[0], icon=queued[1])
+
+
+def request_delete(item_label: str, on_confirm, success_msg: str = None):
+    """Queue a delete for confirmation. Every edit surface on the profile page is now a
+    st.dialog, and Streamlit forbids opening a dialog from inside another dialog — so a
+    Delete click inside an edit dialog can't open the confirm dialog directly. Instead
+    this stashes the request in session_state and closes the current dialog via rerun;
+    render_pending_delete_dialog() (called once at page top level, outside any dialog)
+    picks it up on the next run and shows the actual confirmation."""
+    st.session_state["_pending_delete"] = {
+        "label": item_label, "on_confirm": on_confirm, "success_msg": success_msg,
+    }
+    st.rerun()
+
+
+def render_pending_delete_dialog():
+    """Call once near the top of a page, outside any dialog, to surface a delete
+    confirmation queued by request_delete() on the previous run."""
+    pending = st.session_state.get("_pending_delete")
+    if pending:
+        _confirm_delete_modal(pending["label"], pending["on_confirm"], pending["success_msg"])
+
+
+def _clear_pending_delete():
+    st.session_state["_pending_delete"] = None
+
+
+@st.dialog("Confirm delete", on_dismiss=_clear_pending_delete)
+def _confirm_delete_modal(item_label, on_confirm, success_msg):
+    # Streamlit dialogs are dismissible by default (X button, Escape, click outside)
+    # independent of the Yes/Cancel buttons below — without on_dismiss=, dismissing
+    # this way skipped both handlers, so _pending_delete never got cleared. It would
+    # then resurface on the very next profile_detail.py page visited (any profile,
+    # not just this one), showing a confirm dialog for an unrelated record and
+    # blocking that page's own buttons behind its modal backdrop until dealt with.
+    st.warning(f"Delete {item_label}? This can't be undone.")
+    c1, c2 = st.columns(2)
+    if c1.button("Yes, delete", key="delete_confirm_yes", use_container_width=True):
+        on_confirm()
+        st.session_state["_pending_delete"] = None
+        queue_toast(success_msg or f"{item_label} deleted.", icon="🗑️")
+        st.rerun()
+    if c2.button("Cancel", key="cancel_confirm_delete", use_container_width=True):
+        st.session_state["_pending_delete"] = None
+        st.rerun()
+
+
+@st.dialog("Link a vet")
+def _link_vet_dialog(profile_id: int, key_prefix: str, available_vets, choice_labels):
+    with st.form(f"{key_prefix}_link_form_dialog", clear_on_submit=True):
+        choice_index = st.selectbox(
+            "Choose a vet", options=range(len(choice_labels)),
+            format_func=lambda i: choice_labels[i], key=f"{key_prefix}_choice"
+        )
+        st.caption("Or fill in the fields below to add a brand new vet:")
+        new_name = st.text_input("Vet name", key=f"{key_prefix}_new_name")
+        new_clinic = st.text_input("Clinic name", key=f"{key_prefix}_new_clinic")
+        new_phone = st.text_input("Phone number", key=f"{key_prefix}_new_phone")
+        new_address = st.text_input("Address", key=f"{key_prefix}_new_address")
+        new_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
+        is_primary = st.checkbox("Set as primary vet", key=f"{key_prefix}_new_primary")
+        c1, c2 = st.columns(2)
+        submitted = c1.form_submit_button("Link Vet", use_container_width=True)
+        cancelled = c2.form_submit_button("Cancel", key=f"cancel_{key_prefix}_link", use_container_width=True)
+    if submitted:
+        if choice_index == 0 and not new_name:
+            st.warning("Vet name is required to add a new vet.")
+        else:
+            if choice_index == 0:
+                vet_id = create_vet(new_name, new_clinic, new_phone, new_address, new_notes)
+            else:
+                vet_id = available_vets[choice_index - 1]["id"]
+            link_vet_to_profile(profile_id, vet_id, is_primary)
+            queue_toast("Vet linked.")
+            st.rerun()
+    if cancelled:
+        st.rerun()
+
+
 def render_vet_picker(profile_id: int, key_prefix: str = "vet"):
     """Reusable 'select a vet or add one inline' widget. Shows vets already linked to
-    this profile (with unlink / set-primary controls), then a form to link an existing
-    vet from the shared directory or create a brand new one without leaving the page."""
+    this profile (with unlink / set-primary controls), then a button that opens a dialog
+    to link an existing vet from the shared directory or create a brand new one."""
     linked = get_vets_for_profile(profile_id)
     if linked:
         for v in linked:
@@ -171,11 +265,16 @@ def render_vet_picker(profile_id: int, key_prefix: str = "vet"):
                     st.write(v["notes"])
                 cols = st.columns(2)
                 if not v["is_primary"]:
-                    if cols[0].button("Set as primary", key=f"{key_prefix}_primary_{v['link_id']}"):
+                    if cols[0].button("Set as primary", key=f"{key_prefix}_primary_{v['link_id']}", use_container_width=True):
                         set_primary_vet(profile_id, v["link_id"])
+                        queue_toast(f"{v['vet_name']} set as primary vet.", icon="⭐")
                         st.rerun()
-                if cols[1].button("Unlink", key=f"delete_{key_prefix}_{v['link_id']}"):
+                # Unlinking is low-stakes and fully reversible (the vet stays in the
+                # shared directory, ready to relink), so it intentionally skips the
+                # confirm-delete dialog and the red danger styling used for real deletes.
+                if cols[1].button("Unlink", key=f"unlink_{key_prefix}_{v['link_id']}", use_container_width=True):
                     unlink_vet_from_profile(v["link_id"])
+                    queue_toast(f"{v['vet_name']} unlinked.", icon="↩️")
                     st.rerun()
     else:
         st.caption("No vets linked yet.")
@@ -189,28 +288,5 @@ def render_vet_picker(profile_id: int, key_prefix: str = "vet"):
         f"{v['vet_name']} — {v['clinic_name'] or 'no clinic listed'}" for v in available_vets
     ]
 
-    with st.expander("➕ Link a vet"):
-        with st.form(f"{key_prefix}_link_form", clear_on_submit=True):
-            choice_index = st.selectbox(
-                "Choose a vet", options=range(len(choice_labels)),
-                format_func=lambda i: choice_labels[i], key=f"{key_prefix}_choice"
-            )
-            st.caption("Or fill in the fields below to add a brand new vet:")
-            new_name = st.text_input("Vet name", key=f"{key_prefix}_new_name")
-            new_clinic = st.text_input("Clinic name", key=f"{key_prefix}_new_clinic")
-            new_phone = st.text_input("Phone number", key=f"{key_prefix}_new_phone")
-            new_address = st.text_input("Address", key=f"{key_prefix}_new_address")
-            new_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
-            is_primary = st.checkbox("Set as primary vet", key=f"{key_prefix}_new_primary")
-
-            if st.form_submit_button("Link Vet"):
-                if choice_index == 0:
-                    if not new_name:
-                        st.warning("Vet name is required to add a new vet.")
-                        return
-                    vet_id = create_vet(new_name, new_clinic, new_phone, new_address, new_notes)
-                else:
-                    vet_id = available_vets[choice_index - 1]["id"]
-                link_vet_to_profile(profile_id, vet_id, is_primary)
-                st.success("Vet linked.")
-                st.rerun()
+    if st.button("➕ Link a vet", key=f"btn_link_{key_prefix}", use_container_width=True):
+        _link_vet_dialog(profile_id, key_prefix, available_vets, choice_labels)

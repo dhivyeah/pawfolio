@@ -39,7 +39,9 @@ if events:
         st.subheader("📋 Upcoming")
     for event in events:
         card = render_event_card(event)
-        event_key = f"card_evt_{event['type']}_{event['record_id']}"
+        overdue = event["days_until"] < 0
+        urgency = "overdue" if overdue else ("soon" if event["days_until"] <= 3 else "upcoming")
+        event_key = f"card_evt_{urgency}_{event['type']}_{event['record_id']}"
         with st.container(border=True, key=event_key):
             cols = st.columns([1, 8, 2])
             with cols[0]:
@@ -48,10 +50,9 @@ if events:
             with cols[1]:
                 st.markdown(f"**{card['profile_name']}** · {card['text']}")
             with cols[2]:
-                overdue = event["days_until"] < 0
-                if overdue:
+                if urgency == "overdue":
                     st.error(card["tag"])
-                elif event["days_until"] <= 3:
+                elif urgency == "soon":
                     st.warning(card["tag"])
                 else:
                     st.success(card["tag"])

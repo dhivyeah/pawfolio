@@ -23,10 +23,10 @@ inject_theme(st)
 with st.container(key="top_nav"):
     nav_cols = st.columns([1, 1, 14])
     with nav_cols[0]:
-        if st.button("🏠", key="nav_home"):
+        if st.button("🏠", key="nav_home", help="Home"):
             st.switch_page(home_page)
     with nav_cols[1]:
-        if st.button("🐾🐾", key="nav_profiles"):
+        if st.button("🐾🐾", key="nav_profiles", help="All the Pups"):
             st.switch_page(all_profiles_page)
 
 st.divider()

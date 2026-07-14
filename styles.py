@@ -75,6 +75,16 @@ p, li, label, [data-testid="stMarkdownContainer"] {
 }
 
 /* ---------- Buttons ---------- */
+/* Three-tier hierarchy so a screen full of buttons doesn't shout at one volume:
+   1. Solid fill (default) — the one action a screen actually wants you to take:
+      Save, Create Profile, confirm-delete's "Yes, delete", View, Link Vet, etc.
+   2. Dashed outline (key prefix "btn_add_"/"btn_link_") — "add something new".
+      Reads like a blank card waiting to be filled in, distinct from "commit this
+      change", and there are 9 of these on the profile page alone so they needed
+      their own, lighter register.
+   3. Ghost outline (key prefix "cancel_") — recedes on purpose; every dialog's
+      Cancel sits next to a solid Save/Add and shouldn't compete with it.
+   Danger (key prefix "delete_") stays its own red-outline tier, defined below. */
 [data-testid="stBaseButton-secondary"],
 [data-testid="stBaseButton-secondaryFormSubmit"] {
     background-color: var(--pf-primary);
@@ -82,15 +92,17 @@ p, li, label, [data-testid="stMarkdownContainer"] {
     border: none;
     border-radius: var(--pf-radius-md);
     font-weight: 600;
-    padding: 0.5rem 1.1rem;
-    min-height: 2.75rem;
+    padding: 0.45rem 1.1rem;
+    min-height: 2.5rem;
     box-shadow: 0 2px 6px rgba(74, 50, 37, 0.12);
-    transition: background-color 0.15s ease, transform 0.1s ease;
+    transition: background-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
 }
 [data-testid="stBaseButton-secondary"]:hover,
 [data-testid="stBaseButton-secondaryFormSubmit"]:hover {
     background-color: var(--pf-primary-hover);
     color: #FFFBF5;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 10px rgba(74, 50, 37, 0.16);
 }
 [data-testid="stBaseButton-secondary"]:active,
 [data-testid="stBaseButton-secondaryFormSubmit"]:active {
@@ -101,6 +113,43 @@ p, li, label, [data-testid="stMarkdownContainer"] {
     background-color: var(--pf-border);
     color: var(--pf-text-muted);
     box-shadow: none;
+    transform: none;
+}
+
+/* tier 2: "add something new" — dashed outline, quieter than a commit action */
+[class*="st-key-btn_add_"] [data-testid="stBaseButton-secondary"],
+[class*="st-key-btn_link_"] [data-testid="stBaseButton-secondary"] {
+    background-color: transparent;
+    color: var(--pf-primary);
+    border: 1.5px dashed var(--pf-primary);
+    box-shadow: none;
+    font-weight: 600;
+}
+[class*="st-key-btn_add_"] [data-testid="stBaseButton-secondary"]:hover,
+[class*="st-key-btn_link_"] [data-testid="stBaseButton-secondary"]:hover {
+    background-color: var(--pf-card-bg-alt);
+    color: var(--pf-primary-hover);
+    border-color: var(--pf-primary-hover);
+    box-shadow: none;
+    transform: none;
+}
+
+/* tier 3: ghost — Cancel buttons recede next to a solid Save/Add/Confirm */
+[class*="st-key-cancel_"] [data-testid="stBaseButton-secondary"],
+[class*="st-key-cancel_"] [data-testid="stBaseButton-secondaryFormSubmit"] {
+    background-color: transparent;
+    color: var(--pf-text-muted);
+    border: 1.5px solid var(--pf-border);
+    box-shadow: none;
+    font-weight: 600;
+}
+[class*="st-key-cancel_"] [data-testid="stBaseButton-secondary"]:hover,
+[class*="st-key-cancel_"] [data-testid="stBaseButton-secondaryFormSubmit"]:hover {
+    background-color: var(--pf-card-bg-alt);
+    color: var(--pf-text);
+    border-color: var(--pf-text-muted);
+    box-shadow: none;
+    transform: none;
 }
 
 /* icon-only top nav buttons (defined in app.py by key) keep their own sizing;
@@ -127,17 +176,47 @@ p, li, label, [data-testid="stMarkdownContainer"] {
     border-color: var(--pf-primary);
 }
 
-/* delete/danger buttons opt in via key="...delete..." */
-[class*="st-key-delete_"] [data-testid="stBaseButton-secondary"] {
+/* delete/danger buttons opt in via key="...delete..." — covers both plain buttons and
+   form-submit buttons, since record "Delete" actions live inside st.form rows. */
+[class*="st-key-delete_"] [data-testid="stBaseButton-secondary"],
+[class*="st-key-delete_"] [data-testid="stBaseButton-secondaryFormSubmit"] {
     background-color: transparent;
     color: var(--pf-danger);
     border: 1.5px solid var(--pf-danger);
     box-shadow: none;
 }
-[class*="st-key-delete_"] [data-testid="stBaseButton-secondary"]:hover {
+[class*="st-key-delete_"] [data-testid="stBaseButton-secondary"]:hover,
+[class*="st-key-delete_"] [data-testid="stBaseButton-secondaryFormSubmit"]:hover {
     background-color: var(--pf-danger);
     color: #FFFBF5;
 }
+
+/* small round icon buttons on the profile header: edit (pencil) and delete (trash) —
+   both used to be their own tabs; now they're one tap from anywhere on the page */
+.st-key-header_edit button, .st-key-header_delete button {
+    font-size: 1.15rem;
+    line-height: 1;
+    padding: 0.4rem 0.7rem;
+    min-width: 2.6rem;
+    min-height: 2.6rem;
+    border-radius: 999px;
+    background-color: var(--pf-card-bg-alt);
+    color: var(--pf-text);
+    box-shadow: none;
+    border: 1.5px solid var(--pf-border);
+}
+.st-key-header_edit button:hover {
+    background-color: var(--pf-card-bg);
+    border-color: var(--pf-primary);
+    transform: none;
+}
+.st-key-header_delete button:hover {
+    background-color: var(--pf-card-bg);
+    border-color: var(--pf-danger);
+    color: var(--pf-danger);
+    transform: none;
+}
+[data-testid="stPopoverBody"] { background-color: var(--pf-bg); }
 
 /* ---------- Inputs ---------- */
 [data-testid="stTextInput"] input,
@@ -187,10 +266,33 @@ input[type="checkbox"], input[type="radio"] {
     border-radius: var(--pf-radius-lg) !important;
     padding: 0.25rem;
     box-shadow: 0 2px 10px rgba(74, 50, 37, 0.06);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
 [class*="st-key-card_"] [data-testid="stVerticalBlock"],
 [class*="st-key-profile_card_"] [data-testid="stVerticalBlock"] {
     gap: 0.5rem;
+}
+/* profile cards on All the Pups are the one card type that's actually clickable
+   (via the View button inside), so give them a tactile hover lift the others
+   don't need */
+[class*="st-key-profile_card_"]:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 18px rgba(74, 50, 37, 0.12);
+    border-color: var(--pf-primary) !important;
+}
+
+/* Dashboard reminder cards carry an urgency tier in their key (see home.py) so an
+   overdue vaccination doesn't read at the same visual volume as a routine one 30
+   days out, or a "new pack member" welcome card. Left accent bar only — the fill
+   stays the same warm card color so the feed doesn't turn into a traffic light. */
+[class*="st-key-card_evt_overdue_"] {
+    border-left: 4px solid var(--pf-danger) !important;
+}
+[class*="st-key-card_evt_soon_"] {
+    border-left: 4px solid var(--pf-accent) !important;
+}
+[class*="st-key-card_evt_upcoming_"] {
+    border-left: 4px solid var(--pf-secondary) !important;
 }
 
 /* ---------- Expanders (used as list-item rows and add/edit forms throughout) ---------- */
@@ -217,10 +319,35 @@ input[type="checkbox"], input[type="radio"] {
     padding: 1.25rem 1.25rem 0.5rem;
 }
 
+/* ---------- Dialogs (st.dialog modals) ---------- */
+/* The visible modal box is an unnamed direct child of the stDialog wrapper (no stable
+   testid of its own) and defaults to Streamlit's plain white, which clashes with the
+   warm theme everywhere else. */
+[data-testid="stDialog"] > div {
+    background-color: var(--pf-bg) !important;
+    border-radius: var(--pf-radius-lg) !important;
+}
+[data-testid="stDialog"] [data-testid="stMarkdownContainer"],
+[data-testid="stDialog"] h1, [data-testid="stDialog"] h2, [data-testid="stDialog"] h3 {
+    color: var(--pf-text);
+}
+
 /* ---------- Tabs ---------- */
-[data-testid="stTabs"] [data-baseweb="tab-list"] {
+/* The tab strip's role="tablist" wrapper is what actually scrolls (current
+   Streamlit no longer exposes data-baseweb="tab-list" here). When the 5 tabs
+   don't fit, BaseWeb overlays absolutely-positioned "Scroll tabs left/right"
+   arrow buttons at the container's edges, on top of whichever tab pill ends
+   up underneath at the current scroll position (not just the scroll
+   extremes) -- clicks meant for that tab land on the invisible arrow
+   instead and silently do nothing. The tab-list is already horizontally
+   scrollable via swipe/drag without the arrows, so drop them rather than
+   try to out-position a fixed overlay. */
+[data-testid="stTabs"] [role="tablist"] {
     gap: 0.4rem;
     border-bottom: none;
+}
+[data-testid="stTabs"] button[aria-label*="Scroll tabs"] {
+    display: none;
 }
 [data-testid="stTab"] {
     border-radius: var(--pf-radius-md);
@@ -257,6 +384,11 @@ input[type="checkbox"], input[type="radio"] {
     h1 { font-size: 1.6rem !important; }
     h2 { font-size: 1.3rem !important; }
     [data-testid="stMainBlockContainer"] { padding-left: 0.75rem; padding-right: 0.75rem; }
+    /* The 4 profile tabs fit comfortably on most phones but were a few px too wide
+       on the narrowest ones (375–390px) with default padding; tighten just the tabs
+       rather than shrinking type or padding everywhere. */
+    [data-testid="stTabs"] [role="tablist"] { gap: 0.15rem; }
+    [data-testid="stTab"] { padding: 0.4rem 0.55rem; }
 }
 </style>
 """

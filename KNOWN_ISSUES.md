@@ -2,8 +2,62 @@
 
 Found during a schema/UI review on 2026-07-10. Bugs 1–3 (crash-level) were fixed immediately
 — see git history / conversation for details. Everything below is a documented edge case, UX
-gap, or structural risk that hasn't been addressed yet. Numbering matches the original review
-so it can be cross-referenced.
+gap, or structural risk. Numbering matches the original review so it can be cross-referenced.
+
+## Priority
+
+Fixed items aren't listed here — they're done. This covers every item still open, classified by
+how urgent fixing it actually is, not by how it happened to get discovered.
+
+### 🔴 Urgent / severe
+*(none currently open)*. Every open item below is a recoverable data-integrity edge case, a
+missing nice-to-have, or a structural/perf concern that's dormant at this app's current scale —
+none of them block usage or lose data silently and permanently. The genuinely severe bugs found
+along the way (the original crash-level 1–3, and bug 30 below) were fixed on discovery rather
+than left open; nothing in that class is currently sitting unfixed.
+
+### 🟡 Can wait
+Real gaps worth fixing in the next pass — mostly silent-bad-data or missing-safety-net issues.
+None of them block using the app today, but each one can produce a confusing or wrong result
+that the user has no way to notice from within the app itself.
+- **5** — no validation that end dates come after start dates anywhere
+- **8** — overdue items never expire/dismiss, and the boarding check-in cutoff is inconsistent
+  with every other event type
+- **12** — HEIC photos (the iPhone camera default) are rejected outright
+- **13** — editing an existing record doesn't re-validate required fields (can save an
+  emptied-out name)
+- **16** — no UI to fix a typo in a vet's own details, or delete one, ever
+- **25** — no confirmation when a reminder is set more than 30 days out
+- **32** — delete-profile warning now gives a *count* of affected other profiles but not
+  *which* ones (partially fixed 2026-07-15 — see entry below)
+
+### 🟢 Low priority
+Papercuts, missing polish, and structural/perf risk that's dormant at the app's current scale
+(a handful of profiles, one user). Worth fixing opportunistically, not worth a dedicated pass.
+- **6** — "Add vet visit" has no required-field check
+- **9** — no boarding pickup/checkout reminder or "currently boarding" indicator
+- **10** — "New Pack Members" section has no dismiss, repeats for a full week
+- **11** — deleted/replaced photo files pile up on disk forever
+- **18** — two records with the same name/date look identical in their list rows
+- **20** — theme leans on undocumented Streamlit internals (bigger surface area now than when
+  first flagged — see re-audit note)
+- **21** — N+1 query pattern on the dashboard
+- **22** — no indexes on foreign key columns
+- **23** — photos re-encoded from disk on every rerun (more reruns now than when first flagged,
+  given how dialog-heavy the UI became — see re-audit note)
+- **24** — text contrast never run through a formal WCAG checker
+- **26** — no vaccine-name guidance or autocomplete
+- **29** — generic "Select a date." accessibility label on every date field, regardless of which
+  field it is
+
+### ⚪ No longer applicable
+- **7** — moot. Described a gap in Add Profile's "first vet visit" block; that whole block was
+  removed when Add Profile got trimmed to identity-only fields in the 2026-07-14 redesign, so
+  there's nothing left to fix.
+
+### 🔵 Needs a decision, not a fix
+- **33** — friends are one-directional, siblings are symmetric. Not broken — just an
+  inconsistency nobody deliberately chose, worth a call either way.
 
 ## Edge cases (real data scenarios that produce bad or surprising results)
 
@@ -18,99 +72,137 @@ so it can be cross-referenced.
    defaults to today, which is a reasonable default for "I'm logging this now."
    No validation was added preventing an end date before a start date — see point 5, still open.
 
-5. **No validation that end dates come after start dates anywhere** — medication `end_date`
-   before `start_date`, boarding `check_out` before `check_in`, vaccination `next_due_date`
-   before `date_given`, spay/neuter date entered while status is "no" — all silently accepted.
+5. **[🟡 Can wait]** **No validation that end dates come after start dates anywhere** —
+   medication `end_date` before `start_date`, boarding `check_out` before `check_in`,
+   vaccination `next_due_date` before `date_given`, spay/neuter date entered while status is
+   "no" — all silently accepted.
 
-6. **"Add vet visit" has no required-field check**, unlike every other "Add" form (which all
-   require at least a name). A completely blank vet visit can be submitted, creating an empty
-   history row with just today's date. (`views/profile_detail.py`, "Add vet visit" form.)
+6. **[🟢 Low priority]** **"Add vet visit" has no required-field check**, unlike every other
+   "Add" form (which all require at least a name). A completely blank vet visit can be
+   submitted, creating an empty history row with just today's date.
+   (`views/profile_detail.py`, "Add vet visit" form.)
 
-7. **Add Profile's "first vet visit" drops notes-only entries.** The gate is
-   `if visit_date or visit_reason:` — it doesn't check `visit_notes`, so a user who only types
-   notes (no date, no reason) silently loses that text on submit. (`views/add_profile.py`)
+7. **[⚪ No longer applicable]** ~~**Add Profile's "first vet visit" drops notes-only
+   entries.**~~ **MOOT 2026-07-15.** Originally: the gate was `if visit_date or visit_reason:`,
+   which didn't check `visit_notes`, so a user who only typed notes (no date, no reason)
+   silently lost that text on submit. Moot now — Add Profile's entire "first vet visit" section
+   (along with vaccination/registration/medication/spay-neuter/surgery/vet-directory/bath/food/
+   boarding/personality/friend) was removed in the 2026-07-14 redesign; the form is identity
+   fields only now, everything else is added from the profile page afterward.
 
-8. **Overdue items have no ceiling and no dismiss mechanism.** Vaccination/medication/bath/
-   food_refill events with no lower bound on `days_until` stay on the dashboard forever once
-   overdue — there's no way to acknowledge/snooze from the feed itself, only by editing the
-   record on the profile page. Meanwhile `boarding_checkin` is the only event type that
-   requires `days_until >= 0`, so a past check-in just silently vanishes from the feed —
-   inconsistent treatment across event types that was never a deliberate, reviewed decision.
-   (`db.py: get_upcoming_events`)
+8. **[🟡 Can wait]** **Overdue items have no ceiling and no dismiss mechanism.**
+   Vaccination/medication/bath/food_refill events with no lower bound on `days_until` stay on
+   the dashboard forever once overdue — there's no way to acknowledge/snooze from the feed
+   itself, only by editing the record on the profile page. Meanwhile `boarding_checkin` is the
+   only event type that requires `days_until >= 0`, so a past check-in just silently vanishes
+   from the feed — inconsistent treatment across event types that was never a deliberate,
+   reviewed decision. (`db.py: get_upcoming_events`)
 
-9. **No "checked out" / pickup reminder.** The dashboard surfaces upcoming boarding
-   *check-ins* but never a "picking up Bobby today" reminder for `check_out_date`, and there's
-   no "currently boarding" status indicator anywhere in the UI.
+9. **[🟢 Low priority]** **No "checked out" / pickup reminder.** The dashboard surfaces
+   upcoming boarding *check-ins* but never a "picking up Bobby today" reminder for
+   `check_out_date`, and there's no "currently boarding" status indicator anywhere in the UI.
 
-10. **"New Pack Members" has no expiry tracking beyond the raw 7-day window and no dismiss.**
-    A profile stays in that section every time Home loads for a full week — fine once, could
-    feel repetitive with daily use.
+10. **[🟢 Low priority]** **"New Pack Members" has no expiry tracking beyond the raw 7-day
+    window and no dismiss.** A profile stays in that section every time Home loads for a full
+    week — fine once, could feel repetitive with daily use.
 
-11. **Photo files are never cleaned up.** Deleting a profile (`db.delete_profile`) or
-    replacing a photo via Edit Identity both leave the old file behind in `photos/` forever.
+11. **[🟢 Low priority]** **Photo files are never cleaned up.** Deleting a profile
+    (`db.delete_profile`) or replacing a photo via Edit Identity both leave the old file behind
+    in `photos/` forever.
 
-12. **iPhone default photo format isn't accepted.** The uploader only allows
+12. **[🟡 Can wait]** **iPhone default photo format isn't accepted.** The uploader only allows
     `png/jpg/jpeg/webp`; HEIC (default format for iOS camera photos) is rejected unless
     converted first — a plausible papercut given the persona.
 
-13. **Editing an existing record doesn't re-validate required fields.** Only the "Add new"
-    forms check for a non-empty name; the "Save" button on an existing vaccination/medication/
-    surgery/etc. edit form will happily save an emptied-out name field.
+13. **[🟡 Can wait]** **Editing an existing record doesn't re-validate required fields.** Only
+    the "Add new" forms check for a non-empty name; the "Save" button on an existing
+    vaccination/medication/surgery/etc. edit form will happily save an emptied-out name field.
 
 ## UX / consistency issues
 
-14. **No confirmation on any sub-record delete.** Vaccination, medication, surgery, vet visit,
-    bath, food refill, boarding stay, friend — every one has a single-click "Delete" with zero
-    confirmation, unlike the profile-level delete which has an explicit checkbox gate.
-    Especially painful for "history" tables (vet visits, boarding stays) meant to be permanent.
+14. ~~**No confirmation on any sub-record delete.**~~ **FIXED 2026-07-14.** Every delete
+    action on the profile page (every sub-record type, plus the profile itself) now opens a
+    confirm dialog (`st.dialog`) before anything is removed. Profile delete also moved off a
+    checkbox-gated button into its own "Delete Profile" tab. Landed alongside a broader rework
+    of the profile page: every "Add" ribbon is now a button that opens a modal instead of an
+    always-present expander, every "Edit" ribbon is a compact row + Edit button that opens a
+    modal, and every save/add/delete gives a toast confirmation. The expander-per-record layout
+    was replaced because Streamlit's expander open/closed state turned out to be "sticky" on
+    the frontend — session_state writes from Python can't force one shut once a user has
+    touched it — so "Cancel" could never reliably collapse it; `st.dialog` always closes
+    cleanly on rerun instead. Two non-obvious `st.dialog` constraints shaped the
+    implementation: dialogs can't nest (a Delete click inside an Edit dialog queues the
+    confirm dialog via session_state + rerun rather than opening it directly), and
+    `st.toast()` called immediately before `st.rerun()` never reaches the browser — the rerun
+    cuts the run off before the message flushes — so toasts are queued the same way and fired
+    on the next run instead (`ui_helpers.queue_toast` / `render_queued_toast`).
 
-15. **"Unlink vet" button is styled as a red/terracotta danger button** (via the `delete_`
-    key prefix in `ui_helpers.render_vet_picker`) even though unlinking is low-stakes and fully
-    reversible (the vet stays in the shared directory) — visually overstates the action.
+15. ~~**"Unlink vet" button is styled as a red/terracotta danger button"**~~ **FIXED
+    2026-07-14.** Renamed its key from the `delete_` prefix to `unlink_` so it no longer picks
+    up the danger-button CSS rule — it still intentionally skips the confirm dialog too, since
+    unlinking is low-stakes and fully reversible (the vet stays in the shared directory).
 
-16. **No way to edit or delete a vet's own details once created.** `db.update_vet` /
-    `db.delete_vet` exist but have no UI surface. A typo in a vet's phone/clinic can never be
-    fixed; unlinking a vet from every profile leaves it in the directory forever with no
-    cleanup path.
+16. **[🟡 Can wait]** **No way to edit or delete a vet's own details once created.**
+    `db.update_vet` / `db.delete_vet` exist but have no UI surface. A typo in a vet's
+    phone/clinic can never be fixed; unlinking a vet from every profile leaves it in the
+    directory forever with no cleanup path.
 
-17. **Health tab is now quite long** — Vaccinations, Registration, Medications, Spay/Neuter,
-    Surgeries, Vet Visit History, and Vets are all stacked in one tab. A lot of scrolling,
-    especially on mobile, to reach the vet picker at the bottom.
+17. ~~**Health tab is now quite long.**~~ **FIXED 2026-07-14.** Vaccinations, Registration,
+    Medications, Spay/Neuter, Surgeries, Vet Visit History, and Vets are each wrapped in their
+    own `st.expander` (collapsed by default, with a live record count in the label) instead of
+    all stacking fully open — landing on Health now shows a compact table of contents instead
+    of a long scroll. Each section expander needed an explicit `key=` (`exp_health_vacc` etc.):
+    without one, Streamlit treats the widget as a new instance whenever its label text changes
+    (the record count), which reset it to collapsed right after every add/edit — the opposite
+    of what an accordion should do.
 
-18. **Duplicate list-item labels are visually indistinguishable.** E.g. two boarding stays with
-    unset dates both render as `🧳 facility — ? to ?`; two vaccinations with the same name/due
-    date look identical in the collapsed expander list.
+18. **[🟢 Low priority]** **Duplicate list-item labels are visually indistinguishable.** E.g.
+    two boarding stays with unset dates both render as `🧳 facility — ? to ?`; two vaccinations
+    with the same name/due date look identical in the collapsed expander list.
 
-19. **Untested tab-row overflow on narrow phones.** Nav icons, cards, and forms were verified
-    not to overflow on mobile, but the 5-item tab row
-    (`🪪 Identity | 🩺 Health | 🎾 Personality | 🐕 Social | 🧺 Care & Logistics`) was never
-    specifically checked for wrapping/scrolling at ~390px width.
+19. ~~**Untested tab-row overflow on narrow phones.**~~ **FIXED 2026-07-14.** Confirmed live
+    (via Playwright at 390px width): when the 5-item tab row overflows, BaseWeb's
+    auto-generated "Scroll tabs left/right" arrow buttons render absolutely-positioned on top
+    of whichever tab pill sits at the container edge — clicks meant for that tab (commonly
+    Social, expanding a friend record pushed it right to the edge) landed on the invisible
+    arrow instead and did nothing, reading as "the tabs stopped working." Fixed in `styles.py`
+    by hiding the arrow buttons (`display: none`) and relying on the tab-list's existing native
+    horizontal scroll (swipe/drag) to reach off-screen tabs instead. Also fixed a dead selector
+    in the same rule block — current Streamlit no longer exposes `data-baseweb="tab-list"`;
+    the working selector is `[role="tablist"]`.
 
 ## Structural / maintenance risks (not bugs today, but fragile)
 
-20. **The entire theme depends on undocumented Streamlit internals** (`data-testid`,
-    `data-baseweb` attributes, structural child selectors like `> div > div` for date/select
-    inputs). This already caused one real bug this session (a `help=` tooltip wrapper silently
-    broke mobile button visibility). A future Streamlit version bump could silently revert
-    buttons/cards/inputs to unstyled defaults with no error, just a visual regression.
+20. **[🟢 Low priority]** **The entire theme depends on undocumented Streamlit internals**
+    (`data-testid`, `data-baseweb` attributes, structural child selectors like `> div > div`
+    for date/select inputs). This already caused one real bug this session (a `help=` tooltip
+    wrapper silently broke mobile button visibility). A future Streamlit version bump could
+    silently revert buttons/cards/inputs to unstyled defaults with no error, just a visual
+    regression. The 2026-07-14/15 redesign added a lot more of this surface area (dialogs,
+    popovers, per-tier button styling, tab internals) — the risk is larger than when first
+    flagged, even though nothing is broken today.
 
-21. **N+1 query pattern in the dashboard.** `get_upcoming_events` opens a fresh SQLite
-    connection per profile per event type (7 sub-queries per profile), and `views/home.py`
-    calls `get_profile()` again per event rather than once per profile. Fine at current scale.
+21. **[🟢 Low priority]** **N+1 query pattern in the dashboard.** `get_upcoming_events` opens
+    a fresh SQLite connection per profile per event type (7 sub-queries per profile), and
+    `views/home.py` calls `get_profile()` again per event rather than once per profile. Fine at
+    current scale.
 
-22. **No index on any foreign key column** (`profile_id` everywhere, `vet_id` in
-    `profile_vets` — aside from the new unique index added for the dedup fix). Every list
-    query is a full table scan. Non-issue at small scale.
+22. **[🟢 Low priority]** **No index on any foreign key column** (`profile_id` everywhere,
+    `vet_id` in `profile_vets` — aside from the unique index added for the vet-dedup fix, and
+    the implicit unique index on `siblings(profile_id_a, profile_id_b)`). Every list query is a
+    full table scan. Non-issue at small scale.
 
-23. **Full photo files are base64-encoded from disk on every single Streamlit rerun**
-    (`ui_helpers._image_data_uri`, no caching via `st.cache_data`). Any widget interaction
-    anywhere on a page re-encodes every visible photo from scratch. Combined with Streamlit's
-    200MB default upload cap and no client-side resizing/compression on upload, a handful of
-    large photos could make the app feel sluggish.
+23. **[🟢 Low priority]** **Full photo files are base64-encoded from disk on every single
+    Streamlit rerun** (`ui_helpers._image_data_uri`, no caching via `st.cache_data`). Any
+    widget interaction anywhere on a page re-encodes every visible photo from scratch. Combined
+    with Streamlit's 200MB default upload cap and no client-side resizing/compression on
+    upload, a handful of large photos could make the app feel sluggish. The dialog-per-action
+    UI added 2026-07-14 means noticeably more reruns per user action than before, so this is
+    somewhat more likely to be felt now than when first flagged.
 
-24. **Contrast wasn't formally verified.** `--pf-text-muted` (`#8A7160` light / `#C9B8A8`
-    dark) against the card backgrounds is a visual judgment call, not something run through an
-    actual WCAG contrast checker.
+24. **[🟢 Low priority]** **Contrast wasn't formally verified.** `--pf-text-muted` (`#8A7160`
+    light / `#C9B8A8` dark) against the card backgrounds is a visual judgment call, not
+    something run through an actual WCAG contrast checker.
 
 ## First-time-user walkthrough findings (2026-07-10)
 
@@ -118,30 +210,87 @@ Found by actually driving the running app end-to-end as a first-time user adding
 setting up a vaccination schedule (via Playwright), not just reading code. Point 4 above (the
 default-due-date trap) was confirmed live this way and is now fixed; the rest are still open.
 
-25. **No feedback when a scheduled reminder is more than 30 days out.** Set a vaccination due
-    date 36 days out, submitted, went back to Home expecting some confirmation — nothing.
-    `get_upcoming_events`'s dashboard-only 30-day horizon means there's no persistent
-    "your reminders are set" indicator anywhere; success reads identically to "did this even
-    save?" A first-time user has no way to confirm the data stuck short of digging back into
-    the profile's Health tab.
+25. **[🟡 Can wait]** **No feedback when a scheduled reminder is more than 30 days out.** Set a
+    vaccination due date 36 days out, submitted, went back to Home expecting some confirmation
+    — nothing. `get_upcoming_events`'s dashboard-only 30-day horizon means there's no
+    persistent "your reminders are set" indicator anywhere; success reads identically to "did
+    this even save?" A first-time user has no way to confirm the data stuck short of digging
+    back into the profile's Health tab.
 
-26. **No guidance on what to type into "Vaccine name."** Blank text field, no examples, no
-    autocomplete for common vaccines (Rabies, DHPP, Bordetella, etc.). A first-time dog owner
-    may not know standard vaccine names to enter.
+26. **[🟢 Low priority]** **No guidance on what to type into "Vaccine name."** Blank text
+    field, no examples, no autocomplete for common vaccines (Rabies, DHPP, Bordetella, etc.). A
+    first-time dog owner may not know standard vaccine names to enter.
 
-27. **"Chennai Corporation Registration" appears with zero explanation.** No text anywhere
-    saying what it is, whether it's required, or that it's safe to skip if you're not in
-    Chennai. Reads as mandatory-adjacent to anyone unfamiliar with the program.
-    (`views/add_profile.py`, `views/profile_detail.py` Health tab)
+27. ~~**"Chennai Corporation Registration" appears with zero explanation.**~~ **FIXED
+    2026-07-14.** Added a one-line caption inside its (now collapsed-by-default) expander:
+    "Only relevant if this dog is registered with the Chennai Corporation's pet program — safe
+    to leave blank otherwise."
 
-28. **🪪 (ID card) emoji on the "Identity" section header rendered as a broken/tofu box** in
-    testing. It's a relatively recent Unicode emoji (2020) and Windows has historically lagged
-    on emoji font updates — this may not be a headless-browser-only artifact and is worth
-    checking on the actual target machine, since it's the very first section header a new user
-    sees.
+28. ~~**🪪 (ID card) emoji rendered as a broken/tofu box.**~~ **FIXED 2026-07-14.** The
+    Identity *tab* it lived on is gone — name/photo/dob/breed/type now edit from a small ✏️
+    button in the profile header instead of their own tab (that tab's only other content was
+    one caption line, since everything else already showed in the header above it). Add
+    Profile's own "🪪 Identity" section header is gone too, for the same reason: the form was
+    trimmed to identity fields only, so a section label restating "Identity" added nothing.
 
-29. **Date input fields have a generic accessibility label.** Every `st.date_input`'s
-    underlying `<input>` has `aria-label="Select a date."` regardless of which field it is
-    (confirmed via DOM inspection) — a screen reader user tabbing through the Add Profile form
-    would hear "Select a date" repeatedly with no indication of which date is which, relying
-    entirely on correct label/input association rather than the accessible name itself.
+29. **[🟢 Low priority]** **Date input fields have a generic accessibility label.** Every
+    `st.date_input`'s underlying `<input>` has `aria-label="Select a date."` regardless of
+    which field it is (confirmed via DOM inspection) — a screen reader user tabbing through the
+    Add Profile form would hear "Select a date" repeatedly with no indication of which date is
+    which, relying entirely on correct label/input association rather than the accessible name
+    itself.
+
+## Known-issues re-audit (2026-07-15)
+
+Went back through every item above against the current code, plus looked specifically for
+anything the nickname/other-notes/friend-linking/sibling-linking/vet-reuse work (2026-07-14/15)
+might have broken or introduced. One of the three new bugs found here (30) turned out to be a
+real, reproducible cause of a support report earlier in that session — a "Home and All the Pups
+buttons stopped responding" complaint that got diagnosed at the time as a dropped connection
+from a dev-server restart. That diagnosis wasn't wrong (server restarts *do* drop old tabs'
+connections), but it wasn't the whole story: bug 30 produces the identical symptom through a
+completely different, code-level path, and was still live in the app until this audit found it.
+
+30. ~~**Dismissing the delete-confirmation dialog via the native ✕ (or Escape / click-outside)
+    left the app stuck.**~~ **FIXED 2026-07-15 (was 🔴 urgent — blocked all navigation until
+    dealt with).** `request_delete()` stashes the pending confirmation in
+    `st.session_state["_pending_delete"]`, and `render_pending_delete_dialog()` (called
+    unconditionally at the top of every profile page) reopens the confirm dialog as long as
+    that key is set — cleared only by the dialog's own "Yes, delete" or "Cancel" button.
+    `st.dialog` is dismissible by default (✕ button, Escape, clicking the backdrop)
+    independently of those two buttons, and dismissing it that way never ran either handler.
+    The stale confirmation would then resurface on the *next* profile page visited — any
+    profile, not just the one it was about — showing a "Delete X?" dialog for an unrelated
+    record and blocking that page's own buttons behind its modal backdrop (reproduced:
+    dismiss a delete-friend confirmation via ✕ on one dog's page, then Home/All the Pups
+    become unclickable everywhere until that leftover dialog is dealt with). Fixed by passing
+    `on_dismiss=` to `@st.dialog("Confirm delete", ...)` so the pending-delete flag clears on
+    *any* dismissal path, not just the two buttons inside it.
+
+31. ~~**"Add sibling" showed a misleading empty-state message.**~~ **FIXED 2026-07-15 (was 🟢
+    low priority — wrong copy, not wrong behavior).** With zero candidates it always said
+    "Every other pup in Pawfolio is already linked as a sibling" — true when every other
+    profile really is already linked, but also shown (and wrong) for a brand-new install with
+    only one profile total, where the real reason is "there's no second pup yet." Now
+    distinguishes the two cases.
+
+32. **[🟡 Can wait]** **Deleting a profile silently drops other profiles' links to it, with no
+    warning of that specific consequence.** `friends.friend_profile_id` and both `siblings`
+    columns are `ON DELETE CASCADE` — confirmed working correctly (tested directly: deleting a
+    profile that another profile had linked as a friend, including a personal note on that
+    friendship, removes that friend-row entirely rather than orphaning it) — but the delete
+    confirmation only ever described records *on this profile*, never "this will also edit N
+    other profiles." **Partially addressed 2026-07-15**: the confirmation now says how many
+    other profiles reference this one as a friend or sibling before you confirm
+    (`db.count_incoming_links`). Still open: it doesn't name *which* profiles, and there's no
+    equivalent warning anywhere else these links are touched.
+
+33. **[🔵 Needs a decision, not a fix]** **Friends are one-directional; siblings are
+    symmetric — same-looking "pick an existing pup" feature, different relationship model.**
+    Add Bobby as Mili's sibling and Bobby's own Social tab shows Mili back automatically (by
+    design — confirmed working). Add Bobby as Mili's *friend* and Bobby's Social tab shows
+    nothing; Mili's note about the friendship is only ever visible from Mili's side. Not
+    necessarily wrong — a friendship someone privately notes down being one-sided is arguably
+    realistic — but it wasn't a deliberate, discussed design choice, just a byproduct of
+    siblings being built as a true many-to-many link table while friends kept their original
+    one-owner shape. Worth a decision either way rather than leaving it as an accident.

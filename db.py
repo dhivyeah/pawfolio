@@ -83,10 +83,16 @@ def init_db():
                 notes TEXT
             )
         """)
+        # A friend can either be freeform (friend_name/friend_birthday typed in directly) or
+        # a link to another real profile already in Pawfolio — friend_profile_id set, name/
+        # birthday looked up live from that profile instead so it can't go stale.
+        _ensure_column(conn, "friends", "friend_profile_id", "INTEGER REFERENCES profiles(id) ON DELETE CASCADE")
 
         # ---- Additive migration: expand Health group on the existing profiles table ----
         _ensure_column(conn, "profiles", "spay_neuter_status", "TEXT DEFAULT 'unknown'")
         _ensure_column(conn, "profiles", "spay_neuter_date", "TEXT")
+        _ensure_column(conn, "profiles", "nickname", "TEXT")
+        _ensure_column(conn, "profiles", "other_notes", "TEXT")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS surgeries (
@@ -136,6 +142,16 @@ def init_db():
         except sqlite3.Error:
             pass
 
+        # ---- New: sibling links between two profiles (symmetric, stored once per pair) ----
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS siblings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id_a INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                profile_id_b INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                UNIQUE(profile_id_a, profile_id_b)
+            )
+        """)
+
         # ---- New: Care & Logistics group ----
         conn.execute("""
             CREATE TABLE IF NOT EXISTS baths (
@@ -172,29 +188,30 @@ def create_profile(data: dict) -> int:
     with get_conn() as conn:
         cur = conn.execute("""
             INSERT INTO profiles (
-                name, photo_path, dob, dob_estimated, breed, profile_type, date_added,
+                name, nickname, photo_path, dob, dob_estimated, breed, profile_type, date_added,
                 hangout_location, reg_id, reg_last_renewed, reg_next_due,
                 likes, dislikes, favorite_toys, favorite_foods, foods_to_avoid, favorite_games,
-                spay_neuter_status, spay_neuter_date
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                spay_neuter_status, spay_neuter_date, other_notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            data.get("name"), data.get("photo_path"), data.get("dob"),
+            data.get("name"), data.get("nickname"), data.get("photo_path"), data.get("dob"),
             int(data.get("dob_estimated", 0)), data.get("breed"), data.get("profile_type"),
             data.get("date_added", date.today().isoformat()), data.get("hangout_location"),
             data.get("reg_id"), data.get("reg_last_renewed"), data.get("reg_next_due"),
             data.get("likes"), data.get("dislikes"), data.get("favorite_toys"),
             data.get("favorite_foods"), data.get("foods_to_avoid"), data.get("favorite_games"),
             data.get("spay_neuter_status", "unknown"), data.get("spay_neuter_date"),
+            data.get("other_notes"),
         ))
         return cur.lastrowid
 
 
 def update_profile(profile_id: int, data: dict):
     fields = [
-        "name", "photo_path", "dob", "dob_estimated", "breed", "profile_type",
+        "name", "nickname", "photo_path", "dob", "dob_estimated", "breed", "profile_type",
         "hangout_location", "reg_id", "reg_last_renewed", "reg_next_due",
         "likes", "dislikes", "favorite_toys", "favorite_foods", "foods_to_avoid", "favorite_games",
-        "spay_neuter_status", "spay_neuter_date"
+        "spay_neuter_status", "spay_neuter_date", "other_notes"
     ]
     set_clause = ", ".join(f"{f} = ?" for f in fields)
     values = [data.get(f) for f in fields]
@@ -305,20 +322,28 @@ def delete_medication(med_id):
 
 # ---------- Friends ----------
 
-def add_friend(profile_id, friend_name, friend_birthday, notes):
+def add_friend(profile_id, friend_name, friend_birthday, notes, friend_profile_id=None):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO friends (profile_id, friend_name, friend_birthday, notes) VALUES (?,?,?,?)",
-            (profile_id, friend_name, friend_birthday, notes)
+            """INSERT INTO friends (profile_id, friend_name, friend_birthday, notes, friend_profile_id)
+               VALUES (?,?,?,?,?)""",
+            (profile_id, friend_name, friend_birthday, notes, friend_profile_id)
         )
 
 
 def get_friends(profile_id):
+    """Friends for a profile. A friend may be freeform (friend_name/friend_birthday typed in
+    directly) or a link to another real profile (friend_profile_id set) — for linked friends,
+    linked_name/linked_photo_path/linked_dob come live from that profile so they can't go
+    stale if the other profile's own name or photo changes later."""
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM friends WHERE profile_id = ? ORDER BY friend_name COLLATE NOCASE",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT f.*, p.name AS linked_name, p.photo_path AS linked_photo_path, p.dob AS linked_dob
+            FROM friends f
+            LEFT JOIN profiles p ON p.id = f.friend_profile_id
+            WHERE f.profile_id = ?
+            ORDER BY COALESCE(p.name, f.friend_name) COLLATE NOCASE
+        """, (profile_id,)).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -333,6 +358,56 @@ def update_friend(friend_id, friend_name, friend_birthday, notes):
 def delete_friend(friend_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM friends WHERE id = ?", (friend_id,))
+
+
+# ---------- Siblings ----------
+# Symmetric relationship between two profiles, stored once per pair with the lower id
+# always in profile_id_a so (A, B) and (B, A) can't both be inserted as separate rows.
+
+def add_sibling(profile_id, other_profile_id):
+    a, b = sorted((profile_id, other_profile_id))
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM siblings WHERE profile_id_a = ? AND profile_id_b = ?", (a, b)
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        cur = conn.execute(
+            "INSERT INTO siblings (profile_id_a, profile_id_b) VALUES (?, ?)", (a, b)
+        )
+        return cur.lastrowid
+
+
+def get_siblings(profile_id):
+    """Sibling profiles linked to this one, joined with their current name/photo."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT s.id AS link_id, p.id AS sibling_id, p.name AS sibling_name,
+                   p.photo_path AS sibling_photo_path
+            FROM siblings s
+            JOIN profiles p ON p.id = CASE WHEN s.profile_id_a = ? THEN s.profile_id_b ELSE s.profile_id_a END
+            WHERE s.profile_id_a = ? OR s.profile_id_b = ?
+            ORDER BY p.name COLLATE NOCASE
+        """, (profile_id, profile_id, profile_id)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def remove_sibling(link_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM siblings WHERE id = ?", (link_id,))
+
+
+def count_incoming_links(profile_id):
+    """How many *other* profiles reference this one as a linked friend, plus how many
+    sibling links it has. Both cascade-delete silently (ON DELETE CASCADE) if this
+    profile is deleted — used to warn about that before it happens, since it's not
+    obvious from this profile's own page that deleting it also edits other profiles."""
+    with get_conn() as conn:
+        friend_refs = conn.execute(
+            "SELECT COUNT(*) AS c FROM friends WHERE friend_profile_id = ?", (profile_id,)
+        ).fetchone()["c"]
+    sibling_refs = len(get_siblings(profile_id))
+    return friend_refs, sibling_refs
 
 
 # ---------- Surgeries ----------
@@ -711,6 +786,8 @@ def get_upcoming_events(horizon_days: int = 30):
                 })
 
         for f in get_friends(pid):
+            if f["friend_profile_id"]:
+                continue  # they already get their own "own_birthday" event on their own profile
             if not f["friend_birthday"]:
                 continue
             days, _turning = _next_annual_occurrence(f["friend_birthday"], today)
