@@ -21,6 +21,7 @@ PAWFOLIO_CSS = """
     --pf-danger: #C1613F;
     --pf-text: #4A3225;
     --pf-text-muted: #8A7160;
+    --pf-input-bg: #FFFDFA;
     --pf-radius-lg: 24px;
     --pf-radius-md: 16px;
     --pf-radius-sm: 10px;
@@ -41,6 +42,7 @@ PAWFOLIO_CSS = """
         --pf-danger: #E08A67;
         --pf-text: #F5E9DD;
         --pf-text-muted: #C9B8A8;
+        --pf-input-bg: #3A2E1F;
     }
 }
 
@@ -226,18 +228,21 @@ p, li, label, [data-testid="stMarkdownContainer"] {
 /* ---------- Inputs ---------- */
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {
-    background-color: #FFFDFA;
+    background-color: var(--pf-input-bg);
     border: 1.5px solid var(--pf-border) !important;
     border-radius: var(--pf-radius-sm) !important;
     color: var(--pf-text);
 }
 /* Date input / selectbox / multiselect render their visible "box" on an inner BaseWeb
    wrapper div (auto-generated class names, not the <input> itself), so target it
-   structurally instead of relying on those unstable classes. */
+   structurally instead of relying on those unstable classes. Background was previously
+   hardcoded to a light cream regardless of theme, while the text color above correctly
+   switched to a light shade in dark mode -- light-on-light, close to unreadable. Both now
+   follow the same --pf-input-bg variable so they always move together. */
 [data-testid="stDateInput"] > div > div,
 [data-testid="stSelectbox"] > div > div,
 [data-testid="stMultiSelect"] > div > div {
-    background-color: #FFFDFA !important;
+    background-color: var(--pf-input-bg) !important;
     border: 1.5px solid var(--pf-border) !important;
     border-radius: var(--pf-radius-sm) !important;
 }

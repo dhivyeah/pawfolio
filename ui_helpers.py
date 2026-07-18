@@ -216,17 +216,36 @@ def _confirm_delete_modal(item_label, on_confirm, success_msg):
 
 @st.dialog("Link a vet")
 def _link_vet_dialog(profile_id: int, key_prefix: str, available_vets, choice_labels):
+    # Lives outside the form, same reactive pattern as the Add Friend / Identity dialogs --
+    # picking an existing vet swaps the "new vet" fields for a read-only look at that vet's
+    # actual stored details instead of leaving unrelated, inert text boxes sitting there
+    # (they used to stay visible and editable no matter what was chosen, which looked like
+    # the selection should populate them and didn't -- anything typed into them was just
+    # silently discarded if an existing vet ended up selected).
+    choice_index = st.selectbox(
+        "Choose a vet", options=range(len(choice_labels)),
+        format_func=lambda i: choice_labels[i], key=f"{key_prefix}_choice"
+    )
+
     with st.form(f"{key_prefix}_link_form_dialog", clear_on_submit=True):
-        choice_index = st.selectbox(
-            "Choose a vet", options=range(len(choice_labels)),
-            format_func=lambda i: choice_labels[i], key=f"{key_prefix}_choice"
-        )
-        st.caption("Or fill in the fields below to add a brand new vet:")
-        new_name = st.text_input("Vet name", key=f"{key_prefix}_new_name")
-        new_clinic = st.text_input("Clinic name", key=f"{key_prefix}_new_clinic")
-        new_phone = st.text_input("Phone number", key=f"{key_prefix}_new_phone")
-        new_address = st.text_input("Address", key=f"{key_prefix}_new_address")
-        new_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
+        if choice_index == 0:
+            st.caption("Fill in the fields below to add a brand new vet:")
+            new_name = st.text_input("Vet name", key=f"{key_prefix}_new_name")
+            new_clinic = st.text_input("Clinic name", key=f"{key_prefix}_new_clinic")
+            new_phone = st.text_input("Phone number", key=f"{key_prefix}_new_phone")
+            new_address = st.text_input("Address", key=f"{key_prefix}_new_address")
+            new_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
+        else:
+            chosen = available_vets[choice_index - 1]
+            st.caption("Linking to this vet's existing entry in your shared vet directory:")
+            st.markdown(f"**{chosen['vet_name']}**" + (f" — {chosen['clinic_name']}" if chosen["clinic_name"] else ""))
+            if chosen["phone"]:
+                st.write(f"📞 {chosen['phone']}")
+            if chosen["address"]:
+                st.write(f"📍 {chosen['address']}")
+            if chosen["notes"]:
+                st.write(chosen["notes"])
+            new_name = new_clinic = new_phone = new_address = new_notes = None
         is_primary = st.checkbox("Set as primary vet", key=f"{key_prefix}_new_primary")
         c1, c2 = st.columns(2)
         submitted = c1.form_submit_button("Link Vet", use_container_width=True)
