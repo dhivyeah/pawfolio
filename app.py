@@ -5,6 +5,13 @@ from notifications import check_and_notify
 
 st.set_page_config(page_title="Pawfolio", page_icon="🐾", layout="wide")
 
+# Injected before any slow work below (DB init, notification check) so the browser gets
+# the stylesheet as early as possible in the stream, rather than after -- Streamlit sends
+# each element to the frontend as its st.* call executes, so on a cold session where
+# init_db()/check_and_notify() take a few real seconds against Postgres, the old ordering
+# left a window where the page could show unstyled/raw content while waiting on them.
+inject_theme(st)
+
 # Gated to once per browser session, same reasoning as the notification check below --
 # init_db() is a batch of idempotent CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS
 # statements. Cheap against a local SQLite file, but Postgres now means each one is a
@@ -31,8 +38,6 @@ pg = st.navigation(
     [home_page, all_profiles_page, add_profile_page, profile_detail_page],
     position="hidden",
 )
-
-inject_theme(st)
 
 # Top icon nav: Home and All the Pups only. "New Profile" lives as a button on the
 # Home dashboard instead of the nav, and Profile Detail is only reached by clicking
