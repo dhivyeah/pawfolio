@@ -444,3 +444,97 @@ for full pass/fail detail per area — only actual defects are logged below, not
   a different dog.
 - **Location:** `views/profile_detail.py`, the `if not profile_id:` fallback block (roughly
   lines 21–31) that back-fills a missing `selected_profile_id` from session state.
+
+## Deployment Review — 2026-07-18
+
+Migrated storage from local SQLite to hosted Supabase Postgres, deployed to Streamlit
+Community Cloud, and did a mobile-responsive CSS pass. Findings below are what's still open
+after that work; two significant performance issues found along the way (connection-per-query
+overhead, and an N+1 query pattern in `get_upcoming_events`) were fixed during the same pass
+rather than left open — see the commit history, not this list, for those.
+
+### Issue: Supabase free-tier database auto-pauses after 7 days of inactivity
+
+- **Severity:** High
+- **Steps to reproduce:** Don't open Pawfolio (or otherwise query the Supabase project) for
+  7+ consecutive days.
+- **Expected vs. actual:** Expected the app to keep working whenever visited. Actual: Supabase
+  free-tier projects automatically pause after a week with no API activity. The next visit
+  after that will fail to connect (or hang while Supabase wakes the project back up, which
+  isn't instant) until the project is manually resumed from the Supabase dashboard. For a
+  personal app that might not be opened daily, this is a real, likely-to-actually-happen
+  scenario, not a theoretical edge case — and see the next item, the failure it causes isn't
+  even a friendly one.
+- **Location:** Infrastructure/hosting configuration, not application code — worth knowing
+  about rather than something to fix in `db.py`. Supabase's dashboard has a setting to disable
+  auto-pause on paid tiers; on free tier the only mitigation is some kind of periodic keep-alive
+  ping, which has its own tradeoffs.
+
+### Issue: No graceful handling if the hosted database is unreachable
+
+- **Severity:** Medium
+- **Steps to reproduce:** Point `DATABASE_URL` at an unreachable/paused/wrong database and
+  load any page.
+- **Expected vs. actual:** Expected a friendly, on-brand error message. Actual: `db.get_conn()`
+  lets the raw `psycopg2.OperationalError` (or the connection pool's own exhaustion error)
+  propagate straight up through whichever view happens to be running, and Streamlit renders it
+  as a raw traceback in the app UI. Combined with the Supabase auto-pause item above, this is
+  the actual failure mode a real visitor would see the first time they open Pawfolio after a
+  week away: a stack trace, not "we're having trouble connecting, try again shortly."
+- **Location:** `db.py`'s `get_conn()` / `_get_pool()` have no try/except around connection
+  acquisition; no view file wraps its `db.*` calls either, so there's no single place currently
+  positioned to catch this.
+
+### Issue: Streamlit Community Cloud cold-start can take 45–90+ seconds and produce inconsistent intermediate rendering
+
+- **Severity:** Medium
+- **Steps to reproduce:** Visit the deployed app after it's been idle long enough for
+  Streamlit Cloud to have spun its container down (free tier does this after a period of no
+  traffic), or hit it with several rapid fresh sessions in a short window.
+- **Expected vs. actual:** Expected a loading indicator followed by working content within a
+  few seconds. Actual: verified the deployed app does eventually render correctly every time
+  (confirmed via three separate full-page screenshots, each showing accurate live data with
+  zero errors) — but getting there took anywhere from ~10s to 60s+ across different attempts,
+  and during that window the page can be in visually-complete-but-not-yet-interactive states.
+  This is Streamlit Community Cloud's own infrastructure cold start (separate from, and in
+  addition to, the in-app database cold-start latency that was already fixed this pass) — free
+  tier apps spin down when idle and take real time to spin back up. Not a bug in Pawfolio's
+  code, but a real characteristic of where it's hosted, worth knowing about rather than being
+  surprised by.
+- **Location:** N/A (Streamlit Community Cloud infrastructure, not application code).
+
+### Issue: `.env` and Streamlit Cloud secrets are two separate, manually-synced copies of the same values
+
+- **Severity:** Low
+- **Steps to reproduce:** Rotate any credential (Resend API key, Supabase database password)
+  in one place.
+- **Expected vs. actual:** Expected one source of truth. Actual: the local `.env` file and
+  Streamlit Cloud's secrets manager each hold an independent copy of `RESEND_API_KEY`,
+  `NOTIFY_EMAIL`, `RESEND_FROM_EMAIL`, and `DATABASE_URL`. Updating one doesn't touch the
+  other, so a rotated credential can silently work locally while the deployed app keeps using
+  the old one (or vice versa) until both are updated by hand.
+- **Location:** N/A (operational/process gap, not application code).
+
+### Issue: Connection pool sized for personal-app scale, not tested under real concurrent load
+
+- **Severity:** Low
+- **Details:** `db.py`'s connection pool is a `ThreadedConnectionPool(1, 10, ...)` — sized for
+  one person occasionally checking in on a handful of dogs, not verified under genuine
+  concurrent multi-user load. If usage ever grows past a few simultaneous sessions, requests
+  beyond the pool's 10 connections would queue rather than fail outright, but that's untested
+  reasoning, not a measured result. Fine at current scale; worth revisiting if Pawfolio ever
+  gets shared with more than one household.
+- **Location:** `db.py`, `_get_pool()`.
+
+### Mobile UX: minor icon-button stacking on profile detail header
+
+- **Severity:** Low
+- **Details:** On a stacked mobile layout, the profile header's edit (pencil) and delete
+  (trash) icon buttons each land in their own full-width row instead of sitting side by side
+  next to the photo the way they do on desktop. Still clearly visible and comfortably tappable
+  (confirmed in mobile screenshots) — just a little more vertical space spent than strictly
+  necessary. Everything else tested clean across dashboard, profile list, profile detail, and
+  the add-profile form at 390px width: no horizontal overflow anywhere, buttons/inputs all
+  meet a comfortable touch-target size, long text wraps instead of forcing scroll.
+- **Location:** `views/profile_detail.py` header layout (`header_cols`), `styles.py` mobile
+  media query.
