@@ -502,6 +502,16 @@ rather than left open — see the commit history, not this list, for those.
   code, but a real characteristic of where it's hosted, worth knowing about rather than being
   surprised by.
 - **Location:** N/A (Streamlit Community Cloud infrastructure, not application code).
+- **Update:** confirmed as more than theoretical — a real cold session showed the injected
+  `<style>` block as literal visible page text instead of an applied stylesheet (raw CSS
+  source, unstyled, on-screen). Root cause: `inject_theme()` ran *after* `init_db()` and
+  `check_and_notify()` in `app.py`, both of which can take several real seconds against
+  Postgres on a cold session — Streamlit streams each element to the browser as its `st.*`
+  call executes, so the stylesheet simply hadn't arrived yet while those ran. Fixed by moving
+  `inject_theme(st)` to immediately after `st.set_page_config()`, before any of the slow
+  calls, so styling arrives first regardless of how long the rest of the page takes. Did not
+  reproduce on a second load (confirmed transient, resolved by a manual refresh at the time),
+  consistent with a narrow cold-start timing window rather than a persistent per-visit bug.
 
 ### Issue: `.env` and Streamlit Cloud secrets are two separate, manually-synced copies of the same values
 
