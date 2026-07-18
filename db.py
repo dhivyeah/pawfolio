@@ -68,12 +68,25 @@ class _ConnWrapper:
         return cur
 
 
+class PawfolioDBError(Exception):
+    """Raised for any database problem, carrying a message that's safe to show a real
+    visitor. The actual underlying error -- which can include hostnames, resolved IPs,
+    and other connection details -- is always logged server-side via print() first (so
+    it's still visible in Streamlit Cloud's logs for debugging) and never included in
+    this exception's own message or allowed to reach the UI as a raw traceback."""
+
+
 @contextmanager
 def get_conn():
     if not _SCHEMA_RE.match(DB_SCHEMA):
         raise RuntimeError(f"Invalid DB_SCHEMA {DB_SCHEMA!r} -- expected a plain identifier.")
-    pool = _get_pool()
-    raw_conn = pool.getconn()
+    try:
+        pool = _get_pool()
+        raw_conn = pool.getconn()
+    except Exception as e:
+        print(f"[db] Could not get a database connection: {e}", flush=True)
+        raise PawfolioDBError("Couldn't connect to the database right now.") from None
+
     conn = _ConnWrapper(raw_conn)
     try:
         # Re-applied on every borrow (not just once when the connection was first opened)
@@ -82,6 +95,10 @@ def get_conn():
         conn.execute(f'SET search_path TO "{DB_SCHEMA}"')
         yield conn
         raw_conn.commit()
+    except psycopg2.Error as e:
+        raw_conn.rollback()
+        print(f"[db] Database error: {e}", flush=True)
+        raise PawfolioDBError("Something went wrong talking to the database.") from None
     except Exception:
         raw_conn.rollback()
         raise
