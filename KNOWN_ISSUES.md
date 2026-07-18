@@ -614,6 +614,15 @@ known state, not something to silently fix here — flagged below so it's tracke
   `client.showErrorDetails` (full tracebacks) is in effect. `db.py`'s `get_conn()`/`_get_pool()`
   have no try/except of their own, and no view file wraps its `db.*` calls either, so an
   uncaught exception is the only thing that currently happens on a connection failure.
+- **Fixed:** `get_conn()` now catches connection/query failures, logs the real error
+  server-side via `print()` (still visible in Streamlit Cloud's logs), and raises a new
+  `PawfolioDBError` carrying only a sanitized message. `app.py` catches that specific
+  exception type around init/notification-check/page-render and shows "🐾 Pawfolio can't
+  reach its database right now. This is usually temporary — try refreshing in a minute or
+  two." instead. Deliberately scoped to `PawfolioDBError` only, not `Exception` broadly, so
+  an unrelated real bug still surfaces normally rather than being masked. Verified locally
+  with a simulated unreachable database: no hostname/IP/file-path/traceback reaches the
+  page, and the real detail is still logged server-side for debugging.
 
 ### Issue: Supabase connection uses the full-privilege `postgres` role, not a scoped-down one
 
