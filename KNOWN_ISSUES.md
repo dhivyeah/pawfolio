@@ -548,3 +548,129 @@ rather than left open — see the commit history, not this list, for those.
   meet a comfortable touch-target size, long text wraps instead of forcing scroll.
 - **Location:** `views/profile_detail.py` header layout (`header_cols`), `styles.py` mobile
   media query.
+
+## Security / Usability / Edge-Case Test Pass — 2026-07-19
+
+Full pass against the live deployed app (mypawfolio.streamlit.app) and its hosted Supabase
+Postgres database, run before Phase 4 (auth) is built. Treats "no login yet" as the current
+known state, not something to silently fix here — flagged below so it's tracked.
+
+**Confirmed clean (no findings):**
+- Full git history (every commit, all branches) re-scanned for secrets: clean. Deployed page
+  source and 144 captured live network requests scanned for the Resend key / DB connection
+  string / Supabase host pattern: zero matches.
+- SQL injection: `'; DROP TABLE profiles; --'`, `' OR '1'='1`, UNION-based payloads, and a
+  50,000-character string all round-tripped safely as literal stored text via `create_profile`
+  — every query in `db.py` uses parameterized `%s` placeholders, never string-built SQL. Table
+  intact, real data untouched after every attempt.
+- XSS: `<script>alert(1)</script>` and `<img src=x onerror=alert(2)>` stored and redisplayed as
+  literal escaped text, never executed (confirmed no `dialog` event fired, confirmed via direct
+  DB round-trip and earlier UI-level testing with the same payloads).
+- App is served over HTTPS (`https://mypawfolio.streamlit.app/`), confirmed directly.
+- Environment variables: with `DATABASE_URL` genuinely unset (not just missing from the current
+  process but with `.env` loading also disabled, to accurately simulate the deployed environment
+  where no `.env` file is ever present), `db.py` raises a clear `RuntimeError` rather than
+  silently falling back to anything — there is no local-file fallback left to fall back to.
+- Resend/notifications failure handling: still confirmed graceful from the earlier deployment
+  review — a simulated Resend API failure doesn't crash the app and doesn't mark events as
+  falsely notified, so it retries cleanly on the next load. This is a real, working contrast to
+  the database-error handling gap below.
+- Regression: `get_upcoming_events` sorting/computation, the milestone notification logic, and
+  the digest dedup functions were all re-verified directly against the live hosted database
+  after all the deployment-phase changes and produce correct results.
+
+### Issue: Any visitor can add, edit, or delete any data — expected for this phase, but flagging as required
+
+- **Severity:** High
+- **Steps to reproduce:** Open the public URL with no account, no login prompt anywhere.
+  Create, edit, or delete any profile, vet, or record.
+- **Expected vs. actual:** Expected (per the stated project plan — auth is Phase 4, not yet
+  built). Actual, confirmed: there is currently zero barrier between "has the URL" and "can
+  permanently delete Bobby Dugar's entire profile and every record on it." Logging this
+  formally per instruction, not fixing it now — this is the single largest exposure until
+  Phase 4 lands, and is the item most worth deciding on urgently if the URL is going to be
+  shared or discovered before then.
+- **Location:** Whole app — no authentication layer exists anywhere in `app.py` or any view.
+
+### Issue: Database connection failures leak internal infrastructure details and full server-side tracebacks to any visitor
+
+- **Severity:** High
+- **Steps to reproduce:** Trigger any `psycopg2` connection failure — simulated locally by
+  pointing `DATABASE_URL` at an invalid Supabase project (safe simulation, real production
+  database never touched). In practice this is not a hypothetical: it's exactly what a real
+  visitor would hit if they open Pawfolio while the Supabase free-tier project has auto-paused
+  (see the existing "Supabase free-tier auto-pauses" entry above) — the two issues share one
+  root cause and one fix.
+- **Expected vs. actual:** Expected a friendly, on-brand "having trouble connecting, try again
+  shortly" message. Actual, confirmed via direct capture of the rendered page: Streamlit's
+  default error display shows the raw `psycopg2.OperationalError` — including the Supabase
+  pooler hostname, its resolved IP address, and the port number — followed by a full Python
+  traceback exposing internal server file paths and the app's internal function call chain
+  (`init_db` → `get_conn` → `_get_pool` → psycopg2 internals), plus "Ask Google" / "Ask ChatGPT"
+  buttons clearly meant for a developer's own debugging session, not a public visitor. No
+  password or full connection string leaks, but meaningful infrastructure reconnaissance
+  information does.
+- **Location:** No `.streamlit/config.toml` exists in the project, so Streamlit's default
+  `client.showErrorDetails` (full tracebacks) is in effect. `db.py`'s `get_conn()`/`_get_pool()`
+  have no try/except of their own, and no view file wraps its `db.*` calls either, so an
+  uncaught exception is the only thing that currently happens on a connection failure.
+
+### Issue: Supabase connection uses the full-privilege `postgres` role, not a scoped-down one
+
+- **Severity:** Medium
+- **Steps to reproduce:** `SELECT current_user, rolbypassrls, rolcreaterole, rolcreatedb FROM
+  pg_roles WHERE rolname = current_user` against the configured `DATABASE_URL`.
+- **Expected vs. actual:** Expected the app to connect with a role scoped to only what
+  Pawfolio's own tables need. Actual, confirmed: the connection authenticates as `postgres`,
+  Supabase's default project-owner role — `rolbypassrls: True` (bypasses any Row Level
+  Security), `rolcreaterole: True`, `rolcreatedb: True`. This is the role the standard Supabase
+  connection-string instructions hand you by default, not a misconfiguration specific to this
+  setup, but it does mean the blast radius of `DATABASE_URL` ever leaking is the entire Supabase
+  project, not just Pawfolio's data. `DATABASE_URL` itself is properly secret-managed (confirmed
+  clean in the git-history and network scans above), so this is a defense-in-depth gap, not an
+  active exposure right now.
+- **Location:** Supabase project configuration (not application code) — tightening this means
+  creating an additional restricted Postgres role with grants limited to Pawfolio's own tables
+  and using that role's connection string instead of the default `postgres` one.
+
+### Issue: Concurrent edits silently overwrite each other with no warning
+
+- **Severity:** Medium
+- **Steps to reproduce:** Open the same profile in two browser sessions (two tabs, or two
+  devices). In session A, edit and save one field (e.g. breed). Before refreshing session B,
+  edit and save a *different* field there (e.g. nickname) using session B's now-stale copy of
+  the record.
+- **Expected vs. actual:** Expected either both changes to merge, or some warning that the
+  record changed underneath the second save. Actual, confirmed directly against the database:
+  session B's save silently reverts session A's change back to its old value — every
+  `update_profile`-style call writes the *entire* row from whatever the form loaded it as,
+  with no version check, so the second save always wins completely and the first save's change
+  vanishes without either session being told. Low real-world likelihood with a single user
+  today, but a real, structural gap the moment Pawfolio is used from more than one device/tab
+  at once (easy to hit accidentally — e.g. phone and laptop open to the same profile).
+- **Location:** `db.py` — every `update_*` function (`update_profile`, `update_vaccination`,
+  etc.) does an unconditional `UPDATE ... WHERE id = %s` with no `updated_at`/version column to
+  detect a stale write.
+
+### Usability: no onboarding context for a first-time visitor
+
+- **Severity:** Low
+- **Details:** Walked through the live app with no prior context. The empty-state and
+  in-progress copy is charming and functionally clear moment-to-moment (button labels are
+  obvious, "New Profile" is the clear first action), but there's no explanation anywhere of
+  *what this app is for*, whose dogs these are, or that a random visitor's edits are real and
+  permanent (ties directly into the no-auth item above — a visitor has no way to know this
+  isn't a public demo/sandbox). Not blocking, since every individual screen is self-explanatory,
+  but worth a short "About Pawfolio" note somewhere once there's an audience beyond one person.
+- **Location:** `views/home.py` (no intro copy beyond the tagline "The feed, but it's just
+  dogs.").
+
+### Usability: loading states use Streamlit's generic skeleton, no Pawfolio-specific messaging
+
+- **Severity:** Low
+- **Details:** While data is being fetched (especially noticeable on a cold Supabase/Streamlit
+  Cloud session, per the existing cold-start entries above), the page shows Streamlit's default
+  gray skeleton blocks with no app-specific loading message. Not broken — it resolves into
+  correct content every time it was tested — just a missed opportunity to keep the warm,
+  quirky voice going through the wait instead of a generic loading placeholder.
+- **Location:** No explicit `st.spinner()`/loading copy anywhere in `views/home.py` or `app.py`.
