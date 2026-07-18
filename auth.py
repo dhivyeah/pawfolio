@@ -47,6 +47,8 @@ def _friendly_auth_error(e: Exception) -> str:
     exception string, since new Supabase error wording could otherwise leak straight to
     the UI un-reviewed."""
     msg = str(e).lower()
+    if "supabase_url" in msg or "supabase_anon_key" in msg:
+        return "Pawfolio's login isn't configured correctly. This is a setup problem, not something wrong with your account."
     if "already registered" in msg or "already exists" in msg or "user already registered" in msg:
         return "That email already has an account — try logging in instead."
     if "invalid login credentials" in msg or "invalid email or password" in msg:
@@ -70,6 +72,7 @@ def sign_up(email: str, password: str):
     try:
         resp = _get_client().auth.sign_up({"email": email, "password": password})
     except Exception as e:
+        print(f"[auth] sign_up() failed: {e}", flush=True)
         return False, None, _friendly_auth_error(e)
     if not resp.user:
         return False, None, "Sign up didn't go through. Please try again."
@@ -90,6 +93,7 @@ def sign_in(email: str, password: str):
     try:
         resp = _get_client().auth.sign_in_with_password({"email": email, "password": password})
     except Exception as e:
+        print(f"[auth] sign_in() failed: {e}", flush=True)
         return False, None, _friendly_auth_error(e)
     if not resp.user or not resp.session:
         return False, None, "Login didn't go through. Please try again."
@@ -124,6 +128,7 @@ def request_password_reset(email: str) -> tuple[bool, str | None]:
         _get_client().auth.reset_password_for_email(email, {"redirect_to": APP_URL})
         return True, None
     except Exception as e:
+        print(f"[auth] request_password_reset() failed: {e}", flush=True)
         return False, _friendly_auth_error(e)
 
 
@@ -148,9 +153,11 @@ def complete_password_reset(access_token: str, refresh_token: str, new_password:
     try:
         client.auth.set_session(access_token, refresh_token)
     except Exception as e:
+        print(f"[auth] complete_password_reset() set_session failed: {e}", flush=True)
         return False, _friendly_auth_error(e)
     try:
         client.auth.update_user({"password": new_password})
         return True, None
     except Exception as e:
+        print(f"[auth] complete_password_reset() update_user failed: {e}", flush=True)
         return False, _friendly_auth_error(e)
