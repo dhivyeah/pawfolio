@@ -82,8 +82,9 @@ p, li, label, [data-testid="stMarkdownContainer"] {
       Reads like a blank card waiting to be filled in, distinct from "commit this
       change", and there are 9 of these on the profile page alone so they needed
       their own, lighter register.
-   3. Ghost outline (key prefix "cancel_") — recedes on purpose; every dialog's
-      Cancel sits next to a solid Save/Add and shouldn't compete with it.
+   3. Ghost outline (key prefix "cancel_"/"mute_") — recedes on purpose; every dialog's
+      Cancel sits next to a solid Save/Add and shouldn't compete with it, and the
+      dashboard's "Mute email for this" is the same idea next to "View profile →".
    Danger (key prefix "delete_") stays its own red-outline tier, defined below. */
 [data-testid="stBaseButton-secondary"],
 [data-testid="stBaseButton-secondaryFormSubmit"] {
@@ -134,9 +135,11 @@ p, li, label, [data-testid="stMarkdownContainer"] {
     transform: none;
 }
 
-/* tier 3: ghost — Cancel buttons recede next to a solid Save/Add/Confirm */
+/* tier 3: ghost — Cancel/Mute buttons recede next to a solid Save/Add/View */
 [class*="st-key-cancel_"] [data-testid="stBaseButton-secondary"],
-[class*="st-key-cancel_"] [data-testid="stBaseButton-secondaryFormSubmit"] {
+[class*="st-key-cancel_"] [data-testid="stBaseButton-secondaryFormSubmit"],
+[class*="st-key-mute_"] [data-testid="stBaseButton-secondary"],
+[class*="st-key-mute_"] [data-testid="stBaseButton-secondaryFormSubmit"] {
     background-color: transparent;
     color: var(--pf-text-muted);
     border: 1.5px solid var(--pf-border);
@@ -144,7 +147,9 @@ p, li, label, [data-testid="stMarkdownContainer"] {
     font-weight: 600;
 }
 [class*="st-key-cancel_"] [data-testid="stBaseButton-secondary"]:hover,
-[class*="st-key-cancel_"] [data-testid="stBaseButton-secondaryFormSubmit"]:hover {
+[class*="st-key-cancel_"] [data-testid="stBaseButton-secondaryFormSubmit"]:hover,
+[class*="st-key-mute_"] [data-testid="stBaseButton-secondary"]:hover,
+[class*="st-key-mute_"] [data-testid="stBaseButton-secondaryFormSubmit"]:hover {
     background-color: var(--pf-card-bg-alt);
     color: var(--pf-text);
     border-color: var(--pf-text-muted);
@@ -383,12 +388,67 @@ input[type="checkbox"], input[type="radio"] {
 @media (max-width: 640px) {
     h1 { font-size: 1.6rem !important; }
     h2 { font-size: 1.3rem !important; }
+    h3 { font-size: 1.1rem !important; }
     [data-testid="stMainBlockContainer"] { padding-left: 0.75rem; padding-right: 0.75rem; }
     /* The 4 profile tabs fit comfortably on most phones but were a few px too wide
        on the narrowest ones (375–390px) with default padding; tighten just the tabs
        rather than shrinking type or padding everywhere. */
     [data-testid="stTabs"] [role="tablist"] { gap: 0.15rem; }
     [data-testid="stTab"] { padding: 0.4rem 0.55rem; }
+    [data-testid="stTab"] p { font-size: 0.85rem; }
+
+    /* Streamlit already stacks st.columns to one-per-row below this width on its own
+       (no layout rebuild needed here) -- what's left is making sure everything that
+       lands in a full-width mobile column is actually comfortable to read and tap,
+       not just narrower. */
+
+    /* Buttons: comfortably above the ~44px touch-target guideline, and full-width so
+       a stacked column of buttons (e.g. View profile / Mute email) reads as a clean
+       vertical list instead of a row of oddly-sized pills. */
+    [data-testid="stBaseButton-secondary"],
+    [data-testid="stBaseButton-secondaryFormSubmit"] {
+        min-height: 2.75rem;
+        width: 100%;
+    }
+    /* Icon-only buttons (top nav, profile header edit/delete) stay compact and
+       square rather than stretching full-width like text buttons do. */
+    .st-key-nav_home button, .st-key-nav_profiles button,
+    .st-key-header_edit button, .st-key-header_delete button {
+        width: auto;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+    }
+
+    /* Long unbroken values (breed descriptions, notes, emails in vet cards) were
+       able to force the page wider than the viewport instead of wrapping, which is
+       what actually causes horizontal scrolling on a phone -- not the layout grid
+       itself, which Streamlit already reflows. */
+    [data-testid="stMarkdownContainer"],
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stCaptionContainer"] {
+        overflow-wrap: break-word;
+        word-break: break-word;
+    }
+
+    /* Cards/expanders had comfortable desktop padding that ate a lot of a 375px-wide
+       screen; keep the same rounded warm look, just tighter. */
+    [class*="st-key-card_"],
+    [class*="st-key-profile_card_"] {
+        padding: 0.15rem;
+    }
+    [data-testid="stExpanderDetails"] { padding: 0.5rem 0.15rem; }
+    [data-testid="stForm"] { padding: 1rem 0.85rem 0.4rem; }
+
+    /* Text inputs/textareas/selects/date pickers: taller so they're easy to tap
+       accurately, same rounded styling as desktop. */
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stDateInput"] > div > div,
+    [data-testid="stSelectbox"] > div > div,
+    [data-testid="stMultiSelect"] > div > div {
+        min-height: 2.75rem;
+    }
+
 }
 </style>
 """

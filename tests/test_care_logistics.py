@@ -285,7 +285,8 @@ def test_link_vet_to_profile_promotes_existing_link_to_primary():
 def test_profile_vets_unique_index_exists():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_profile_vets_unique'"
+            "SELECT indexname FROM pg_indexes WHERE schemaname = %s AND indexname = 'idx_profile_vets_unique'",
+            (db.DB_SCHEMA,)
         ).fetchall()
     assert len(rows) == 1
 

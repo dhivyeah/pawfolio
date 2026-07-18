@@ -30,6 +30,8 @@ that the user has no way to notice from within the app itself.
 - **25** — no confirmation when a reminder is set more than 30 days out
 - **32** — delete-profile warning now gives a *count* of affected other profiles but not
   *which* ones (partially fixed 2026-07-15 — see entry below)
+- **35** — email digest send failures retry on every single app load with no backoff, and the
+  default sender can only reach one email address until a domain is verified
 
 ### 🟢 Low priority
 Papercuts, missing polish, and structural/perf risk that's dormant at the app's current scale
@@ -49,6 +51,16 @@ Papercuts, missing polish, and structural/perf risk that's dormant at the app's 
 - **26** — no vaccine-name guidance or autocomplete
 - **29** — generic "Select a date." accessibility label on every date field, regardless of which
   field it is
+- **36** — email notification horizon (7 days) is hardcoded, no in-app control over it
+- **37** — "today" and the once-a-day send cap are based on the server's clock, not
+  timezone-aware
+- **38** — `notified_events` rows are never cleaned up when the record or profile they refer to
+  is deleted
+- **39** — sending a digest blocks that page load until the Resend API call returns (once a day,
+  at most)
+- **40** — theoretical duplicate-digest race if two sessions open at nearly the same instant
+- **41** — digest layout/readability untested with many due items in one email
+- **42** — no in-app visibility into notification history, and no pause/mute control
 
 ### ⚪ No longer applicable
 - **7** — moot. Described a gap in Add Profile's "first vet visit" block; that whole block was
@@ -58,6 +70,10 @@ Papercuts, missing polish, and structural/perf risk that's dormant at the app's 
 ### 🔵 Needs a decision, not a fix
 - **33** — friends are one-directional, siblings are symmetric. Not broken — just an
   inconsistency nobody deliberately chose, worth a call either way.
+- **34** — a due item is only ever emailed once and never again unless its due date changes —
+  even as it goes from "due in 7 days" to "3 days overdue." Deliberate anti-spam behavior or a
+  missed-urgency gap, depending on what's actually wanted; wasn't a considered decision either
+  way when it was built.
 
 ## Edge cases (real data scenarios that produce bad or surprising results)
 
@@ -294,3 +310,137 @@ completely different, code-level path, and was still live in the app until this 
     realistic — but it wasn't a deliberate, discussed design choice, just a byproduct of
     siblings being built as a true many-to-many link table while friends kept their original
     one-owner shape. Worth a decision either way rather than leaving it as an accident.
+
+## Email notifications review (2026-07-15)
+
+New feature: a warm-voiced email digest, sent via Resend, checked once per browser session on
+app load (`notifications.check_and_notify`, wired in from `app.py`), reusing
+`db.get_upcoming_events` and `voice.render_event_card` as-is rather than reimplementing either.
+Tested directly (not just read): first-run with no prior notification state, nothing-due
+no-op, per-item dedup, the once-a-day send cap holding independently of dedup, a changed due
+date correctly un-suppressing an item, and a real send through Resend confirmed landing in the
+inbox. Findings below are from deliberately trying to break it, not just reading the code.
+
+One genuine near-miss during setup, not a code bug: real Resend credentials briefly ended up in
+`.env.example` (the tracked template file) instead of `.env` (the gitignored real one), because
+the file that got hand-edited had the wrong name. Caught before anything was staged or
+committed — confirmed via `git status`/`git diff --cached` that `.env.example` had never been
+added to git at any point, so nothing was ever at risk of reaching GitHub. Fixed by moving the
+real values into a correctly-named `.env` (confirmed gitignored via `git check-ignore -v`) and
+restoring `.env.example` to placeholders. No code or design lesson here beyond: a `.env.example`
+file is only as safe as everyone actually treating it as read-only.
+
+34. **[🔵 Needs a decision, not a fix]** **A due item is emailed at most once, ever, unless its
+    due date changes.** Dedup is keyed on `(event_type, record_id, state_key)`, where
+    `state_key` is the due date itself (or, for birthdays, the calendar date of that
+    occurrence). That means an item mentioned once while "due in 7 days" — the outer edge of the
+    notification horizon — goes completely silent from then on: it's never mentioned again as it
+    becomes "due tomorrow," then "3 days overdue," then "3 weeks overdue," unless the underlying
+    record is edited. This is *deliberate* anti-repeat-spam behavior, and it's what "notify once
+    per item until it's marked done/updated" in the original spec literally asks for — but it
+    also means the digest can't be relied on as an ongoing "this is still not done" nag the way
+    the dashboard's persistent overdue tag can. Worth being explicit about which of those two
+    things this is supposed to be, since right now it's the first one by construction, not by a
+    considered choice between the two.
+
+35. **[🟡 Can wait]** **Two related Resend operational limits, neither one fatal, both worth
+    knowing about before relying on this daily.** (a) A failed send doesn't mark anything as
+    notified, so the *same* digest retries on the *next* app load — correct for "don't lose a
+    notification because Resend hiccuped once," but there's no backoff, so if Resend is down or
+    misconfigured for an extended stretch, every single app load that day re-attempts the same
+    API call. At normal personal-app usage (a handful of loads a day) this is a non-issue; it'd
+    only matter under either heavy reloading or a prolonged outage. (b) The default
+    `RESEND_FROM_EMAIL` (`onboarding@resend.dev`) is Resend's shared sandbox sender, which by
+    Resend's own rules can only deliver to the email address on the Resend account itself —
+    fine for the initial setup and confirmed working end-to-end here, but it'll silently start
+    failing (retrying per (a), logged to the console, no in-app indication) if `NOTIFY_EMAIL` is
+    ever pointed at a different address without first verifying a real sending domain in Resend.
+
+36. **[🟢 Low priority]** **The 7-day notification horizon is a hardcoded constant**
+    (`notifications.NOTIFY_HORIZON_DAYS`), deliberately tighter than the dashboard's 30-day
+    display window so the digest doesn't fire for anything a month out — but there's no way to
+    change it short of editing the constant.
+
+37. **[🟢 Low priority]** **"Today" and the once-a-day send cap are computed from the server's
+    local clock** (`date.today()`, `datetime.now()`), not any explicit timezone. A non-issue
+    running locally on the same machine as the browser; would need attention if this were ever
+    deployed somewhere whose server clock doesn't match the user's own timezone — the daily cap
+    could reset at an unexpected hour relative to the user's actual day.
+
+38. **[🟢 Low priority]** **`notified_events` rows are never cleaned up.** If a vaccination (or
+    any other due-tracked record) is deleted, or an entire profile is deleted, its dedup rows
+    stay in `notified_events` forever as harmless clutter — same shape of issue as the
+    already-documented photo-file cleanup gap (11).
+
+39. **[🟢 Low priority]** **Sending a digest blocks that particular page load until the Resend
+    API call returns or times out** (10s timeout). Only happens at most once a day, and only on
+    whichever load happens to be the one that triggers it — every other load that day is a pure
+    local DB check with no network call, effectively instant.
+
+40. **[🟢 Low priority]** **Theoretical duplicate-send race.** The once-a-day cap is a plain
+    `SELECT` + later `INSERT`, not an atomic check-and-set. If two browser sessions happened to
+    both load the app for the first time that day within the same narrow window, both could read
+    "not sent yet" before either finishes sending, producing two digest emails instead of one.
+    Vanishingly unlikely for a single-user local app opened from one browser at a time; would
+    matter more under real concurrent access.
+
+41. **[🟢 Low priority]** **Digest appearance was only verified with a single due item.** The
+    HTML/text layout (colored left-border cards, one per event) looked clean and on-brand in
+    that test — genuinely worth a look at how it reads with, say, 8-10 items at once before
+    trusting it at higher volume, since that's a very plausible real digest on a day with several
+    things due across multiple dogs.
+
+42. **[🟢 Low priority]** **No in-app visibility into the notification system at all** — no way
+    to see when the last digest went out, what it said, or to pause/mute it temporarily, short of
+    editing `.env` or querying the database directly. Consistent with "don't touch existing
+    pages" for this pass, but worth knowing it's a closed box from the UI's perspective.
+
+## E2E QA Test Pass — 2026-07-15
+
+Full end-to-end pass across Add/Edit/Delete Profile, Dashboard, Vet entity, Boarding history,
+Notifications, and edge cases (empty DB, long text, special characters, duplicate names, date
+extremes). Logged here in the format requested for this pass rather than the numbered-prose
+style above. Two new issues found; everything else tested clean. See conversation/test scripts
+for full pass/fail detail per area — only actual defects are logged below, not passing checks.
+
+### Issue: Due dates more than ~10 years in the future silently fail to save
+
+- **Severity:** Medium
+- **Steps to reproduce:**
+  1. Open any dialog with a due-date field — e.g. a profile's Health tab → Vaccinations →
+     Add vaccination.
+  2. Type a due date more than ~10 years from today into "Next due date" (e.g. today is
+     2026-07-15; type `2037/06/15`).
+  3. Submit the form.
+- **Expected vs. actual:** Expected the date to either save as typed, or the app to visibly
+  reject/clamp the out-of-range date and explain why. Actual: the record saves, a "Vaccination
+  added." success toast appears, but the due date is silently dropped and displays as "next due
+  unset" — no error, no warning, nothing to tell the user the date didn't take. Confirmed the
+  threshold sits between 10 and 11 years out (9y and 10y out both saved correctly in testing;
+  11y out silently failed every time).
+- **Location:** `views/profile_detail.py` — every `st.date_input(..., value=None)` call that
+  has no explicit `max_value` set: vaccination `next_due_date`, medication `end_date`,
+  registration `reg_next_due`/`reg_last_renewed`, bath `next_due_date`, food refill
+  `next_refill_date`, boarding `check_in_date`/`check_out_date`. Root cause is almost certainly
+  Streamlit's own default navigable range for an unbounded `date_input` (~today ± 10 years) —
+  the fix is adding an explicit `max_value` (and `min_value`, for symmetry) to each of these
+  calls, the same way the DOB field already does.
+
+### Issue: Hard browser refresh on a Profile Detail page silently switches to a different, arbitrary profile
+
+- **Severity:** Medium
+- **Steps to reproduce:**
+  1. Open any dog's profile page.
+  2. Refresh the browser tab (F5 / hard reload — not just clicking around inside the app).
+- **Expected vs. actual:** Expected to either stay on the same dog's profile, or get some
+  indication the view changed. Actual: `st.session_state["selected_profile_id"]` doesn't survive
+  a hard reload (Streamlit starts a fresh session on a new WebSocket connection, which is
+  expected Streamlit behavior), so the page falls back to a bare "Pick a profile" selectbox
+  defaulting to whichever profile sorts first alphabetically — silently showing a *different dog*
+  with no banner or message explaining why the view changed. Data itself is never lost (verified
+  separately that edits persist correctly in the database across both a refresh and a full app
+  restart) — this is purely a navigation/orientation gap. Worth fixing since a user who refreshes
+  mid-edit could reasonably think their change didn't save, when really they're just looking at
+  a different dog.
+- **Location:** `views/profile_detail.py`, the `if not profile_id:` fallback block (roughly
+  lines 21–31) that back-fills a missing `selected_profile_id` from session state.

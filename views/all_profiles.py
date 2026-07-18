@@ -61,7 +61,10 @@ else:
         for col, profile in zip(cols, row):
             with col:
                 with st.container(border=True, key=f"profile_card_{profile['id']}"):
-                    show_photo(profile["photo_path"], responsive=True, shape="circle")
+                    # max_width caps how big the circle can grow when a row has very few
+                    # cards (e.g. one search result, or a single stacked mobile column) --
+                    # responsive=True alone would let it fill the entire column width.
+                    show_photo(profile["photo_path"], responsive=True, shape="circle", max_width=180)
                     st.markdown(f"**{profile['name']}**")
                     type_label = "🏠 My Dog" if profile["profile_type"] == "my_dog" else "🌳 Community Dog"
                     st.caption(type_label)

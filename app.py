@@ -1,9 +1,26 @@
 import streamlit as st
 from db import init_db
 from styles import inject_theme
+from notifications import check_and_notify
 
 st.set_page_config(page_title="Pawfolio", page_icon="🐾", layout="wide")
-init_db()
+
+# Gated to once per browser session, same reasoning as the notification check below --
+# init_db() is a batch of idempotent CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS
+# statements. Cheap against a local SQLite file, but Postgres now means each one is a
+# network round-trip to Supabase, so re-running the whole batch on every single widget
+# click (Streamlit's normal rerun-the-script-top-to-bottom model) would add needless
+# latency to everything in the app, not just page loads.
+if not st.session_state.get("_db_initialized"):
+    init_db()
+    st.session_state["_db_initialized"] = True
+
+# "On app load" means once per browser session, not once per rerun -- app.py re-executes
+# top to bottom on every widget interaction anywhere in the app (Streamlit's normal
+# execution model), so an unconditional call here would re-check on every single click.
+if not st.session_state.get("_notify_checked"):
+    check_and_notify()
+    st.session_state["_notify_checked"] = True
 
 home_page = st.Page("views/home.py", title="Home", icon="🏠", default=True)
 all_profiles_page = st.Page("views/all_profiles.py", title="All the Pups", icon="🐾")

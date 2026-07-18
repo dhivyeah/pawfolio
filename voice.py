@@ -138,3 +138,17 @@ EMPTY_STATE_MESSAGES = [
     "pet parenting happening here. ✨",
     "All clear! Nothing due in the next 30 days. This is either excellent planning or a trap. Enjoy it either way.",
 ]
+
+DIGEST_INTROS = [
+    "Here's what the pack has on its calendar:",
+    "A little bird (well, a dog) asked me to remind you about a few things:",
+    "Quick digest before the tail wags become a distraction:",
+    "The dogs can't email you themselves, so here we are:",
+]
+
+DIGEST_OUTROS = [
+    "That's the whole list. Go pet something. 🐾",
+    "Handled with care by Pawfolio, the feed that's just dogs.",
+    "No further action needed except maybe a belly rub.",
+    "Sent with love, some drool, and one (1) dashboard's worth of reminders.",
+]
