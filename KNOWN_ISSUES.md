@@ -43,7 +43,6 @@ Papercuts, missing polish, and structural/perf risk that's dormant at the app's 
 - **18** — two records with the same name/date look identical in their list rows
 - **20** — theme leans on undocumented Streamlit internals (bigger surface area now than when
   first flagged — see re-audit note)
-- **21** — N+1 query pattern on the dashboard
 - **22** — no indexes on foreign key columns
 - **23** — photos re-encoded from disk on every rerun (more reruns now than when first flagged,
   given how dialog-heavy the UI became — see re-audit note)
@@ -60,7 +59,8 @@ Papercuts, missing polish, and structural/perf risk that's dormant at the app's 
   at most)
 - **40** — theoretical duplicate-digest race if two sessions open at nearly the same instant
 - **41** — digest layout/readability untested with many due items in one email
-- **42** — no in-app visibility into notification history, and no pause/mute control
+- **42** — no in-app visibility into notification send history (a per-item mute control was
+  added 2026-07-15 — see entry below)
 
 ### ⚪ No longer applicable
 - **7** — moot. Described a gap in Add Profile's "first vet visit" block; that whole block was
@@ -70,10 +70,6 @@ Papercuts, missing polish, and structural/perf risk that's dormant at the app's 
 ### 🔵 Needs a decision, not a fix
 - **33** — friends are one-directional, siblings are symmetric. Not broken — just an
   inconsistency nobody deliberately chose, worth a call either way.
-- **34** — a due item is only ever emailed once and never again unless its due date changes —
-  even as it goes from "due in 7 days" to "3 days overdue." Deliberate anti-spam behavior or a
-  missed-urgency gap, depending on what's actually wanted; wasn't a considered decision either
-  way when it was built.
 
 ## Edge cases (real data scenarios that produce bad or surprising results)
 
@@ -198,10 +194,14 @@ Papercuts, missing polish, and structural/perf risk that's dormant at the app's 
     popovers, per-tier button styling, tab internals) — the risk is larger than when first
     flagged, even though nothing is broken today.
 
-21. **[🟢 Low priority]** **N+1 query pattern in the dashboard.** `get_upcoming_events` opens
-    a fresh SQLite connection per profile per event type (7 sub-queries per profile), and
-    `views/home.py` calls `get_profile()` again per event rather than once per profile. Fine at
-    current scale.
+21. ~~**N+1 query pattern in the dashboard.**~~ **FIXED 2026-07-18.** Was: `get_upcoming_events`
+    opened a fresh SQLite connection per profile per event type (7 sub-queries per profile).
+    Migrating to hosted Postgres made this expensive rather than free (each one became a real
+    network round-trip), so it was rewritten during the deployment pass to fetch each record
+    type once across all profiles and group in Python instead — see the Deployment Review
+    section below and the commit history for detail. `views/home.py` still calls `get_profile()`
+    once per event rather than caching per profile — a smaller, still-open instance of the same
+    shape of issue, low-impact at current data volume.
 
 22. **[🟢 Low priority]** **No index on any foreign key column** (`profile_id` everywhere,
     `vet_id` in `profile_vets` — aside from the unique index added for the vet-dedup fix, and
@@ -330,18 +330,17 @@ real values into a correctly-named `.env` (confirmed gitignored via `git check-i
 restoring `.env.example` to placeholders. No code or design lesson here beyond: a `.env.example`
 file is only as safe as everyone actually treating it as read-only.
 
-34. **[🔵 Needs a decision, not a fix]** **A due item is emailed at most once, ever, unless its
-    due date changes.** Dedup is keyed on `(event_type, record_id, state_key)`, where
-    `state_key` is the due date itself (or, for birthdays, the calendar date of that
-    occurrence). That means an item mentioned once while "due in 7 days" — the outer edge of the
-    notification horizon — goes completely silent from then on: it's never mentioned again as it
-    becomes "due tomorrow," then "3 days overdue," then "3 weeks overdue," unless the underlying
-    record is edited. This is *deliberate* anti-repeat-spam behavior, and it's what "notify once
-    per item until it's marked done/updated" in the original spec literally asks for — but it
-    also means the digest can't be relied on as an ongoing "this is still not done" nag the way
-    the dashboard's persistent overdue tag can. Worth being explicit about which of those two
-    things this is supposed to be, since right now it's the first one by construction, not by a
-    considered choice between the two.
+34. ~~**A due item is emailed at most once, ever, unless its due date changes.**~~ **RESOLVED
+    2026-07-15 — decision made and built, not just documented.** Was flagged as an open question
+    ("notify once and go silent forever" vs. "keep nagging until resolved"). Redesigned into a
+    third option, deliberately: notify at each of four countdown checkpoints as a due item
+    crosses 7/3/1/0 days out, then stop — never notifying once something goes overdue, since the
+    app has no way to know whether an overdue item was actually handled outside Pawfolio or just
+    not yet updated here. `notifications.MILESTONES`, dedup now keyed on
+    `(event_type, record_id, state_key, milestone)` instead of just `(event_type, record_id,
+    state_key)`. A "Mute email for this" action was also added on dashboard cards (see item 42
+    below) so a user can silence the remaining checkpoints for one item early if they've already
+    handled it.
 
 35. **[🟡 Can wait]** **Two related Resend operational limits, neither one fatal, both worth
     knowing about before relying on this daily.** (a) A failed send doesn't mark anything as
@@ -390,10 +389,11 @@ file is only as safe as everyone actually treating it as read-only.
     trusting it at higher volume, since that's a very plausible real digest on a day with several
     things due across multiple dogs.
 
-42. **[🟢 Low priority]** **No in-app visibility into the notification system at all** — no way
-    to see when the last digest went out, what it said, or to pause/mute it temporarily, short of
-    editing `.env` or querying the database directly. Consistent with "don't touch existing
-    pages" for this pass, but worth knowing it's a closed box from the UI's perspective.
+42. **[🟢 Low priority]** **No in-app visibility into the notification system** — no way to see
+    when the last digest went out or what it said, short of querying the database directly.
+    **Partially addressed 2026-07-15**: a "Mute email for this" button on each dashboard card
+    now gives per-item pause control without touching `.env` or the database — added alongside
+    the item 34 redesign above. Still open: no send history/log visible anywhere in the UI.
 
 ## E2E QA Test Pass — 2026-07-15
 
@@ -463,27 +463,14 @@ rather than left open — see the commit history, not this list, for those.
   after that will fail to connect (or hang while Supabase wakes the project back up, which
   isn't instant) until the project is manually resumed from the Supabase dashboard. For a
   personal app that might not be opened daily, this is a real, likely-to-actually-happen
-  scenario, not a theoretical edge case — and see the next item, the failure it causes isn't
-  even a friendly one.
+  scenario, not a theoretical edge case. (What a visitor actually *sees* when this happens was
+  a separate, worse problem — raw tracebacks leaking infrastructure details — found in the
+  2026-07-19 pass below and fixed there; this entry is about the pause itself, which is still
+  a real, unaddressed risk.)
 - **Location:** Infrastructure/hosting configuration, not application code — worth knowing
   about rather than something to fix in `db.py`. Supabase's dashboard has a setting to disable
   auto-pause on paid tiers; on free tier the only mitigation is some kind of periodic keep-alive
   ping, which has its own tradeoffs.
-
-### Issue: No graceful handling if the hosted database is unreachable
-
-- **Severity:** Medium
-- **Steps to reproduce:** Point `DATABASE_URL` at an unreachable/paused/wrong database and
-  load any page.
-- **Expected vs. actual:** Expected a friendly, on-brand error message. Actual: `db.get_conn()`
-  lets the raw `psycopg2.OperationalError` (or the connection pool's own exhaustion error)
-  propagate straight up through whichever view happens to be running, and Streamlit renders it
-  as a raw traceback in the app UI. Combined with the Supabase auto-pause item above, this is
-  the actual failure mode a real visitor would see the first time they open Pawfolio after a
-  week away: a stack trace, not "we're having trouble connecting, try again shortly."
-- **Location:** `db.py`'s `get_conn()` / `_get_pool()` have no try/except around connection
-  acquisition; no view file wraps its `db.*` calls either, so there's no single place currently
-  positioned to catch this.
 
 ### Issue: Streamlit Community Cloud cold-start can take 45–90+ seconds and produce inconsistent intermediate rendering
 
