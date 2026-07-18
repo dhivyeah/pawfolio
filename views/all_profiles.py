@@ -2,6 +2,8 @@ import streamlit as st
 from db import get_all_profiles, calc_age_str
 from ui_helpers import show_photo, render_queued_toast
 
+owner_id = st.session_state["auth_user"]["user_id"]
+
 # Surfaces the "profile deleted" confirmation queued by profile_detail.py just before
 # it redirected here (see ui_helpers.queue_toast for why it can't fire inline there).
 render_queued_toast()
@@ -23,11 +25,11 @@ with filter_cols[1]:
 search = st.text_input("Search by name", placeholder="Search by name…")
 
 if filter_choice == "My Dogs":
-    profiles = get_all_profiles(profile_type="my_dog")
+    profiles = get_all_profiles(owner_id, profile_type="my_dog")
 elif filter_choice == "Community Dogs":
-    profiles = get_all_profiles(profile_type="community_dog")
+    profiles = get_all_profiles(owner_id, profile_type="community_dog")
 else:
-    profiles = get_all_profiles()
+    profiles = get_all_profiles(owner_id)
 
 if search:
     needle = search.strip().lower()
@@ -38,7 +40,7 @@ if sort_choice == "Recently added":
 elif sort_choice == "Upcoming soonest":
     from db import get_upcoming_events
     soonest = {}
-    for e in get_upcoming_events(horizon_days=365):
+    for e in get_upcoming_events(owner_id, horizon_days=365):
         soonest.setdefault(e["profile_id"], e["days_until"])
     profiles = sorted(profiles, key=lambda p: soonest.get(p["id"], float("inf")))
 # "Name (A–Z)" is already the query's default order — nothing to do.

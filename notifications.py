@@ -127,15 +127,21 @@ def _send_email(subject, html_body, text_body, api_key, to_email, from_email):
         return False, f"request to Resend failed: {e}"
 
 
-def check_and_notify():
-    """Call once per app load (see app.py -- gated to once per browser session there, since
-    Streamlit re-runs this module's caller on every widget interaction otherwise). Sends at
-    most one digest a day, only for events not already included in a previously-successful
-    digest. Never raises -- a notification problem should never break the app itself."""
+def check_and_notify(owner_id: str, to_email: str):
+    """Call once per logged-in user, once per app load (see app.py -- gated to once per
+    browser session there, since Streamlit re-runs this module's caller on every widget
+    interaction otherwise). Sends at most one digest a day *per user* (was once a day
+    globally, before Phase 4 -- one user's digest used to suppress every other user's for
+    the rest of that day, which stopped making sense the moment there was more than one
+    account), only for events not already included in a previously-successful digest.
+    `to_email` is that user's own Supabase Auth account email -- there's no separate
+    NOTIFY_EMAIL to configure anymore, since "which address" now has an unambiguous
+    per-user answer. Never raises -- a notification problem should never break the app
+    itself."""
     try:
-        if db.was_digest_sent_today():
+        if db.was_digest_sent_today(owner_id):
             return
-        events = db.get_upcoming_events(horizon_days=NOTIFY_HORIZON_DAYS)
+        events = db.get_upcoming_events(owner_id, horizon_days=NOTIFY_HORIZON_DAYS)
         # get_upcoming_events has no lower bound on days_until (see KNOWN_ISSUES 8) -- it
         # returns overdue items too. Notifications intentionally stop at "due today," so
         # anything already overdue is filtered out here rather than ever reaching a
@@ -149,17 +155,16 @@ def check_and_notify():
             return
 
         api_key = os.environ.get("RESEND_API_KEY")
-        to_email = os.environ.get("NOTIFY_EMAIL")
         from_email = os.environ.get("RESEND_FROM_EMAIL", DEFAULT_FROM_EMAIL)
         if not api_key or not to_email:
-            print("[notifications] RESEND_API_KEY or NOTIFY_EMAIL not set in .env -- skipping email digest.", flush=True)
+            print("[notifications] RESEND_API_KEY not set, or user has no email -- skipping email digest.", flush=True)
             return
 
         subject, html_body, text_body = _build_digest(new_events)
         success, error = _send_email(subject, html_body, text_body, api_key, to_email, from_email)
         if success:
             db.mark_events_notified(_event_key(e) for e in new_events)
-            db.record_digest_sent()
+            db.record_digest_sent(owner_id)
             print(f"[notifications] Digest sent to {to_email} ({len(new_events)} item(s)).", flush=True)
         else:
             print(f"[notifications] Digest send failed, will retry next app load: {error}", flush=True)

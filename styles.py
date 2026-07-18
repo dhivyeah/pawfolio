@@ -8,6 +8,15 @@ is untouched.
 
 PAWFOLIO_CSS = """
 <style>
+/* Font Awesome Free, via cdnjs (no account/API key, no cost) -- used only for the
+   dashboard/profile-page icon circles introduced in the 2026-07-18 visual polish pass.
+   @import must be the very first rule in the stylesheet or browsers silently ignore it.
+   Not visually confirmed in a real browser this session (no browser tool available) --
+   see KNOWN_ISSUES.md. If this CDN is ever unreachable, the icon circles render as empty
+   colored circles (Font Awesome's own fallback square/box glyph, not a broken-image icon)
+   rather than breaking the page. */
+@import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css');
+
 :root {
     --pf-bg: #FFF8F0;
     --pf-card-bg: #FFF3E6;
@@ -18,6 +27,8 @@ PAWFOLIO_CSS = """
     --pf-secondary: #8FAE8B;
     --pf-accent: #F0C05A;
     --pf-pink: #E8A0A0;
+    --pf-blue: #8FB8C9;
+    --pf-lavender: #B9A0CC;
     --pf-danger: #C1613F;
     --pf-text: #4A3225;
     --pf-text-muted: #8A7160;
@@ -39,6 +50,8 @@ PAWFOLIO_CSS = """
         --pf-secondary: #A8C6A0;
         --pf-accent: #F3CD7E;
         --pf-pink: #E8B3B3;
+        --pf-blue: #A8CDD9;
+        --pf-lavender: #CBB5DC;
         --pf-danger: #E08A67;
         --pf-text: #F5E9DD;
         --pf-text-muted: #C9B8A8;
@@ -291,7 +304,9 @@ input[type="checkbox"], input[type="radio"] {
     border-color: var(--pf-primary) !important;
 }
 
-/* Dashboard reminder cards carry an urgency tier in their key (see home.py) so an
+/* Dashboard reminder cards carry an urgency tier in their key (see home.py, and
+   ui_helpers.urgency_tier -- the single source of truth both this and the cards' own
+   top-right badge color derive from, so the two signals can't drift out of sync) so an
    overdue vaccination doesn't read at the same visual volume as a routine one 30
    days out, or a "new pack member" welcome card. Left accent bar only — the fill
    stays the same warm card color so the feed doesn't turn into a traffic light. */
@@ -299,10 +314,13 @@ input[type="checkbox"], input[type="radio"] {
     border-left: 4px solid var(--pf-danger) !important;
 }
 [class*="st-key-card_evt_soon_"] {
+    border-left: 4px solid var(--pf-primary) !important;
+}
+[class*="st-key-card_evt_week_"] {
     border-left: 4px solid var(--pf-accent) !important;
 }
-[class*="st-key-card_evt_upcoming_"] {
-    border-left: 4px solid var(--pf-secondary) !important;
+[class*="st-key-card_evt_routine_"] {
+    border-left: 4px solid var(--pf-border) !important;
 }
 
 /* ---------- Expanders (used as list-item rows and add/edit forms throughout) ---------- */

@@ -3,6 +3,8 @@ import streamlit as st
 from db import create_profile
 from ui_helpers import save_uploaded_photo, queue_toast
 
+owner_id = st.session_state["auth_user"]["user_id"]
+
 st.title("New Profile")
 st.caption(
     "Create a profile for one of your own dogs, or a friendly dog from the neighborhood. "
@@ -50,7 +52,7 @@ with st.form("add_profile_form"):
                 "date_added": date.today().isoformat(),
                 "hangout_location": hangout_location or None,
                 "other_notes": other_notes or None,
-            })
+            }, owner_id)
             st.session_state["selected_profile_id"] = profile_id
             queue_toast(f"{name}'s profile has been created! 🎉", icon="🐾")
             st.switch_page("views/profile_detail.py")

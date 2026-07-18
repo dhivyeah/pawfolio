@@ -3,6 +3,14 @@
 Was SQLite; migrated to hosted Postgres so the app can run on Streamlit Community Cloud
 without a local file for storage. See migrate_to_postgres.py for the one-time data move
 from an existing local pawfolio.db, and README/KNOWN_ISSUES for the deployment notes.
+
+Phase 4: every profile/vet is owned by a Supabase Auth user (owner_id, a UUID from
+auth.users). Every function that touches profile- or vet-scoped data takes owner_id and
+filters by it -- either directly (profiles, vets, notification_log all have their own
+owner_id column) or via a JOIN back through profiles/vets for the child tables
+(vaccinations, medications, friends, etc.), which deliberately do NOT get their own
+owner_id column -- ownership lives in exactly one place per record type, so a child row
+can never drift out of sync with who actually owns its parent.
 """
 import os
 import re
@@ -15,9 +23,6 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
 load_dotenv()
-
-PHOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
-os.makedirs(PHOTOS_DIR, exist_ok=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -178,6 +183,19 @@ def init_db():
         _ensure_column_sql("profiles", "nickname", "TEXT"),
         _ensure_column_sql("profiles", "other_notes", "TEXT"),
 
+        # ---- Phase 4: per-user ownership. Nullable at the DB level -- existing rows have
+        # no owner until the one-time migration backfills them (see migrate_add_owner.py) --
+        # but every function below always requires and filters by owner_id regardless, so
+        # enforcement lives at the application layer rather than a NOT NULL constraint that
+        # would make the additive migration a two-step dance for no real benefit at this scale.
+        # Deliberately not a foreign key into auth.users(id): that table is Supabase's own
+        # (lives in the `auth` schema, not this app's), and a hard FK into it would mean
+        # every test run needs a real Supabase Auth user to exist first just to satisfy the
+        # constraint -- a plain UUID column keeps ownership correctness an application-layer
+        # guarantee (every write path already requires a real owner_id from a logged-in
+        # session) rather than tying schema setup to Supabase's own internal table.
+        _ensure_column_sql("profiles", "owner_id", "UUID"),
+
         """CREATE TABLE IF NOT EXISTS surgeries (
             id SERIAL PRIMARY KEY,
             profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -193,7 +211,9 @@ def init_db():
             notes TEXT
         );""",
 
-        # ---- Shared vet directory, reusable across profiles ----
+        # ---- Vet directory. Was shared across all profiles; Phase 4 makes it per-owner
+        # instead (own_id column) since "no shared/public visibility yet" applies to vets
+        # too -- one user's vet list (names, phone numbers) shouldn't be visible to another.
         """CREATE TABLE IF NOT EXISTS vets (
             id SERIAL PRIMARY KEY,
             vet_name TEXT NOT NULL,
@@ -202,6 +222,7 @@ def init_db():
             address TEXT,
             notes TEXT
         );""",
+        _ensure_column_sql("vets", "owner_id", "UUID"),
         """CREATE TABLE IF NOT EXISTS profile_vets (
             id SERIAL PRIMARY KEY,
             profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -255,7 +276,9 @@ def init_db():
         # is emailed once as it crosses into "due in 7 days," once again at "3 days," etc.,
         # rather than a single one-time notification. When the underlying record changes (due
         # date edited) or a birthday rolls to its next occurrence, state_key changes too, so
-        # the whole countdown starts fresh.
+        # the whole countdown starts fresh. No owner_id column needed here -- record_id is a
+        # globally unique SERIAL id from its own table, so two different users' events can
+        # never collide on the same dedup key even without an explicit owner filter.
         """CREATE TABLE IF NOT EXISTS notified_events (
             id SERIAL PRIMARY KEY,
             event_type TEXT NOT NULL,
@@ -268,10 +291,41 @@ def init_db():
            ON notified_events(event_type, record_id, state_key, milestone);""",
         # notification_log caps digest sending to once per day regardless of how many new
         # events show up -- only gets a row when a digest was actually, successfully sent.
+        # Phase 4: gained an owner_id column so the once-a-day cap applies per user, not
+        # globally -- otherwise one user's digest would suppress every other user's for the
+        # rest of that day.
         """CREATE TABLE IF NOT EXISTS notification_log (
             id SERIAL PRIMARY KEY,
             sent_at TEXT NOT NULL
         );""",
+        _ensure_column_sql("notification_log", "owner_id", "UUID"),
+
+        # ---- Photo storage (Supabase Storage, "photos" bucket, private) ----
+        # RLS policies scoping storage.objects so a signed-in user can only
+        # read/write/delete objects under their own {auth.uid()}/... folder -- see
+        # photo_storage.py, which uploads to exactly that path and authenticates each
+        # call as the current user (not the shared anon key alone) so these policies
+        # actually apply. storage.foldername() is a Supabase-provided helper that splits
+        # an object path on "/" into an array; [1] is the first segment, i.e. the
+        # owner-id folder a photo lives under. Global to the bucket, not per-schema, so
+        # re-asserting them on every init_db() call (including test runs against a
+        # throwaway schema) is harmless -- DROP+CREATE makes each one idempotent.
+        """DROP POLICY IF EXISTS "Users manage own photos - select" ON storage.objects;""",
+        """CREATE POLICY "Users manage own photos - select" ON storage.objects
+           FOR SELECT TO authenticated
+           USING (bucket_id = 'photos' AND (storage.foldername(name))[1] = auth.uid()::text);""",
+        """DROP POLICY IF EXISTS "Users manage own photos - insert" ON storage.objects;""",
+        """CREATE POLICY "Users manage own photos - insert" ON storage.objects
+           FOR INSERT TO authenticated
+           WITH CHECK (bucket_id = 'photos' AND (storage.foldername(name))[1] = auth.uid()::text);""",
+        """DROP POLICY IF EXISTS "Users manage own photos - update" ON storage.objects;""",
+        """CREATE POLICY "Users manage own photos - update" ON storage.objects
+           FOR UPDATE TO authenticated
+           USING (bucket_id = 'photos' AND (storage.foldername(name))[1] = auth.uid()::text);""",
+        """DROP POLICY IF EXISTS "Users manage own photos - delete" ON storage.objects;""",
+        """CREATE POLICY "Users manage own photos - delete" ON storage.objects
+           FOR DELETE TO authenticated
+           USING (bucket_id = 'photos' AND (storage.foldername(name))[1] = auth.uid()::text);""",
     ]
     with get_conn() as conn:
         conn.execute("\n".join(statements))
@@ -279,15 +333,15 @@ def init_db():
 
 # ---------- Profiles ----------
 
-def create_profile(data: dict) -> int:
+def create_profile(data: dict, owner_id: str) -> int:
     with get_conn() as conn:
         cur = conn.execute("""
             INSERT INTO profiles (
                 name, nickname, photo_path, dob, dob_estimated, breed, profile_type, date_added,
                 hangout_location, reg_id, reg_last_renewed, reg_next_due,
                 likes, dislikes, favorite_toys, favorite_foods, foods_to_avoid, favorite_games,
-                spay_neuter_status, spay_neuter_date, other_notes
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                spay_neuter_status, spay_neuter_date, other_notes, owner_id
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
         """, (
             data.get("name"), data.get("nickname"), data.get("photo_path"), data.get("dob"),
@@ -297,12 +351,12 @@ def create_profile(data: dict) -> int:
             data.get("likes"), data.get("dislikes"), data.get("favorite_toys"),
             data.get("favorite_foods"), data.get("foods_to_avoid"), data.get("favorite_games"),
             data.get("spay_neuter_status", "unknown"), data.get("spay_neuter_date"),
-            data.get("other_notes"),
+            data.get("other_notes"), owner_id,
         ))
         return cur.fetchone()["id"]
 
 
-def update_profile(profile_id: int, data: dict):
+def update_profile(profile_id: int, data: dict, owner_id: str):
     fields = [
         "name", "nickname", "photo_path", "dob", "dob_estimated", "breed", "profile_type",
         "hangout_location", "reg_id", "reg_last_renewed", "reg_next_due",
@@ -311,158 +365,203 @@ def update_profile(profile_id: int, data: dict):
     ]
     set_clause = ", ".join(f"{f} = %s" for f in fields)
     values = [data.get(f) for f in fields]
-    values.append(profile_id)
+    values[fields.index("dob_estimated")] = int(data.get("dob_estimated", 0))
+    values.extend([profile_id, owner_id])
     with get_conn() as conn:
-        conn.execute(f"UPDATE profiles SET {set_clause} WHERE id = %s", values)
+        conn.execute(f"UPDATE profiles SET {set_clause} WHERE id = %s AND owner_id = %s", values)
 
 
-def delete_profile(profile_id: int):
+def delete_profile(profile_id: int, owner_id: str):
     with get_conn() as conn:
-        conn.execute("DELETE FROM profiles WHERE id = %s", (profile_id,))
+        conn.execute("DELETE FROM profiles WHERE id = %s AND owner_id = %s", (profile_id, owner_id))
 
 
-def get_profile(profile_id: int):
+def get_profile(profile_id: int, owner_id: str):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM profiles WHERE id = %s", (profile_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE id = %s AND owner_id = %s", (profile_id, owner_id)
+        ).fetchone()
         return dict(row) if row else None
 
 
-def get_all_profiles(profile_type: str = None):
+def get_all_profiles(owner_id: str, profile_type: str = None):
     with get_conn() as conn:
         if profile_type:
             rows = conn.execute(
-                "SELECT * FROM profiles WHERE profile_type = %s ORDER BY LOWER(name)",
-                (profile_type,)
+                "SELECT * FROM profiles WHERE owner_id = %s AND profile_type = %s ORDER BY LOWER(name)",
+                (owner_id, profile_type)
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM profiles ORDER BY LOWER(name)").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM profiles WHERE owner_id = %s ORDER BY LOWER(name)", (owner_id,)
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_recently_added_profiles(days: int = 7):
+def get_recently_added_profiles(owner_id: str, days: int = 7):
     """Profiles added within the last `days` days, most recent first."""
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM profiles WHERE date_added >= %s ORDER BY date_added DESC, id DESC",
-            (cutoff,)
+            "SELECT * FROM profiles WHERE owner_id = %s AND date_added >= %s ORDER BY date_added DESC, id DESC",
+            (owner_id, cutoff)
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 # ---------- Vaccinations ----------
 
-def add_vaccination(profile_id, vaccine_name, date_given, next_due_date):
+def add_vaccination(profile_id, vaccine_name, date_given, next_due_date, owner_id):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO vaccinations (profile_id, vaccine_name, date_given, next_due_date) VALUES (%s,%s,%s,%s)",
-            (profile_id, vaccine_name, date_given, next_due_date)
+            """INSERT INTO vaccinations (profile_id, vaccine_name, date_given, next_due_date)
+               SELECT %s, %s, %s, %s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, vaccine_name, date_given, next_due_date, profile_id, owner_id)
         )
 
 
-def get_vaccinations(profile_id):
+def get_vaccinations(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM vaccinations WHERE profile_id = %s ORDER BY next_due_date IS NULL, next_due_date",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT v.* FROM vaccinations v JOIN profiles p ON p.id = v.profile_id
+            WHERE v.profile_id = %s AND p.owner_id = %s
+            ORDER BY v.next_due_date IS NULL, v.next_due_date
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_vaccination(vacc_id, vaccine_name, date_given, next_due_date):
+def update_vaccination(vacc_id, vaccine_name, date_given, next_due_date, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE vaccinations SET vaccine_name=%s, date_given=%s, next_due_date=%s WHERE id=%s",
-            (vaccine_name, date_given, next_due_date, vacc_id)
-        )
+        conn.execute("""
+            UPDATE vaccinations SET vaccine_name=%s, date_given=%s, next_due_date=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (vaccine_name, date_given, next_due_date, vacc_id, owner_id))
 
 
-def delete_vaccination(vacc_id):
+def delete_vaccination(vacc_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM vaccinations WHERE id = %s", (vacc_id,))
+        conn.execute("""
+            DELETE FROM vaccinations WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (vacc_id, owner_id))
 
 
 # ---------- Medications ----------
 
-def add_medication(profile_id, med_name, dosage, frequency, start_date, end_date, ongoing):
+def add_medication(profile_id, med_name, dosage, frequency, start_date, end_date, ongoing, owner_id):
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO medications (profile_id, med_name, dosage, frequency, start_date, end_date, ongoing)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-            (profile_id, med_name, dosage, frequency, start_date, end_date, int(ongoing))
+               SELECT %s,%s,%s,%s,%s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, med_name, dosage, frequency, start_date, end_date, int(ongoing), profile_id, owner_id)
         )
 
 
-def get_medications(profile_id):
+def get_medications(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM medications WHERE profile_id = %s ORDER BY ongoing DESC, end_date",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT m.* FROM medications m JOIN profiles p ON p.id = m.profile_id
+            WHERE m.profile_id = %s AND p.owner_id = %s
+            ORDER BY m.ongoing DESC, m.end_date
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_medication(med_id, med_name, dosage, frequency, start_date, end_date, ongoing):
+def update_medication(med_id, med_name, dosage, frequency, start_date, end_date, ongoing, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            """UPDATE medications SET med_name=%s, dosage=%s, frequency=%s, start_date=%s, end_date=%s, ongoing=%s
-               WHERE id=%s""",
-            (med_name, dosage, frequency, start_date, end_date, int(ongoing), med_id)
-        )
+        conn.execute("""
+            UPDATE medications SET med_name=%s, dosage=%s, frequency=%s, start_date=%s, end_date=%s, ongoing=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (med_name, dosage, frequency, start_date, end_date, int(ongoing), med_id, owner_id))
 
 
-def delete_medication(med_id):
+def delete_medication(med_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM medications WHERE id = %s", (med_id,))
+        conn.execute("""
+            DELETE FROM medications WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (med_id, owner_id))
 
 
 # ---------- Friends ----------
 
-def add_friend(profile_id, friend_name, friend_birthday, notes, friend_profile_id=None):
+def add_friend(profile_id, friend_name, friend_birthday, notes, owner_id, friend_profile_id=None):
     with get_conn() as conn:
+        # A linked friend (friend_profile_id set) must belong to the same owner as
+        # profile_id -- checked explicitly rather than trusted, same as add_sibling's
+        # owned_count check and link_vet_to_profile's owns_profile/owns_vet checks. The UI
+        # only ever offers same-owner candidates for this picker, but this function's own
+        # contract shouldn't depend on that staying true forever.
+        if friend_profile_id is not None:
+            owns_friend_profile = conn.execute(
+                "SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s",
+                (friend_profile_id, owner_id)
+            ).fetchone()
+            if not owns_friend_profile:
+                raise PawfolioDBError("Couldn't link that profile as a friend.")
         conn.execute(
             """INSERT INTO friends (profile_id, friend_name, friend_birthday, notes, friend_profile_id)
-               VALUES (%s,%s,%s,%s,%s)""",
-            (profile_id, friend_name, friend_birthday, notes, friend_profile_id)
+               SELECT %s,%s,%s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, friend_name, friend_birthday, notes, friend_profile_id, profile_id, owner_id)
         )
 
 
-def get_friends(profile_id):
+def get_friends(profile_id, owner_id):
     """Friends for a profile. A friend may be freeform (friend_name/friend_birthday typed in
     directly) or a link to another real profile (friend_profile_id set) — for linked friends,
     linked_name/linked_photo_path/linked_dob come live from that profile so they can't go
     stale if the other profile's own name or photo changes later."""
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT f.*, p.name AS linked_name, p.photo_path AS linked_photo_path, p.dob AS linked_dob
+            SELECT f.*, lp.name AS linked_name, lp.photo_path AS linked_photo_path, lp.dob AS linked_dob
             FROM friends f
-            LEFT JOIN profiles p ON p.id = f.friend_profile_id
-            WHERE f.profile_id = %s
-            ORDER BY LOWER(COALESCE(p.name, f.friend_name))
-        """, (profile_id,)).fetchall()
+            JOIN profiles p ON p.id = f.profile_id
+            LEFT JOIN profiles lp ON lp.id = f.friend_profile_id AND lp.owner_id = p.owner_id
+            WHERE f.profile_id = %s AND p.owner_id = %s
+            ORDER BY LOWER(COALESCE(lp.name, f.friend_name))
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_friend(friend_id, friend_name, friend_birthday, notes):
+def update_friend(friend_id, friend_name, friend_birthday, notes, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE friends SET friend_name=%s, friend_birthday=%s, notes=%s WHERE id=%s",
-            (friend_name, friend_birthday, notes, friend_id)
-        )
+        conn.execute("""
+            UPDATE friends SET friend_name=%s, friend_birthday=%s, notes=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (friend_name, friend_birthday, notes, friend_id, owner_id))
 
 
-def delete_friend(friend_id):
+def delete_friend(friend_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM friends WHERE id = %s", (friend_id,))
+        conn.execute("""
+            DELETE FROM friends WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (friend_id, owner_id))
 
 
 # ---------- Siblings ----------
 # Symmetric relationship between two profiles, stored once per pair with the lower id
 # always in profile_id_a so (A, B) and (B, A) can't both be inserted as separate rows.
 
-def add_sibling(profile_id, other_profile_id):
+def add_sibling(profile_id, other_profile_id, owner_id):
     a, b = sorted((profile_id, other_profile_id))
     with get_conn() as conn:
+        # Both sides must belong to the same owner -- a sibling link is only ever offered
+        # between two of the *same* user's own dogs (see views/profile_detail.py's picker,
+        # which only lists candidates from that user's own get_all_profiles()), but this is
+        # verified again here rather than trusted, same as every other write in this file.
+        owned_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM profiles WHERE id IN (%s, %s) AND owner_id = %s",
+            (a, b, owner_id)
+        ).fetchone()["c"]
+        if owned_count != 2:
+            raise PawfolioDBError("Couldn't link those two profiles.")
         existing = conn.execute(
             "SELECT id FROM siblings WHERE profile_id_a = %s AND profile_id_b = %s", (a, b)
         ).fetchone()
@@ -474,142 +573,179 @@ def add_sibling(profile_id, other_profile_id):
         return cur.fetchone()["id"]
 
 
-def get_siblings(profile_id):
+def get_siblings(profile_id, owner_id):
     """Sibling profiles linked to this one, joined with their current name/photo."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT s.id AS link_id, p.id AS sibling_id, p.name AS sibling_name,
                    p.photo_path AS sibling_photo_path
             FROM siblings s
+            JOIN profiles anchor ON anchor.id = %s AND anchor.owner_id = %s
             JOIN profiles p ON p.id = CASE WHEN s.profile_id_a = %s THEN s.profile_id_b ELSE s.profile_id_a END
             WHERE s.profile_id_a = %s OR s.profile_id_b = %s
             ORDER BY LOWER(p.name)
-        """, (profile_id, profile_id, profile_id)).fetchall()
+        """, (profile_id, owner_id, profile_id, profile_id, profile_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def remove_sibling(link_id):
+def remove_sibling(link_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM siblings WHERE id = %s", (link_id,))
+        conn.execute("""
+            DELETE FROM siblings WHERE id = %s AND (
+                profile_id_a IN (SELECT id FROM profiles WHERE owner_id=%s)
+                OR profile_id_b IN (SELECT id FROM profiles WHERE owner_id=%s)
+            )
+        """, (link_id, owner_id, owner_id))
 
 
-def count_incoming_links(profile_id):
+def count_incoming_links(profile_id, owner_id):
     """How many *other* profiles reference this one as a linked friend, plus how many
     sibling links it has. Both cascade-delete silently (ON DELETE CASCADE) if this
     profile is deleted — used to warn about that before it happens, since it's not
     obvious from this profile's own page that deleting it also edits other profiles."""
     with get_conn() as conn:
-        friend_refs = conn.execute(
-            "SELECT COUNT(*) AS c FROM friends WHERE friend_profile_id = %s", (profile_id,)
-        ).fetchone()["c"]
-    sibling_refs = len(get_siblings(profile_id))
+        friend_refs = conn.execute("""
+            SELECT COUNT(*) AS c FROM friends f JOIN profiles p ON p.id = f.profile_id
+            WHERE f.friend_profile_id = %s AND p.owner_id = %s
+        """, (profile_id, owner_id)).fetchone()["c"]
+    sibling_refs = len(get_siblings(profile_id, owner_id))
     return friend_refs, sibling_refs
 
 
 # ---------- Surgeries ----------
 
-def add_surgery(profile_id, surgery_name, surgery_date, notes):
+def add_surgery(profile_id, surgery_name, surgery_date, notes, owner_id):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO surgeries (profile_id, surgery_name, surgery_date, notes) VALUES (%s,%s,%s,%s)",
-            (profile_id, surgery_name, surgery_date, notes)
+            """INSERT INTO surgeries (profile_id, surgery_name, surgery_date, notes)
+               SELECT %s,%s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, surgery_name, surgery_date, notes, profile_id, owner_id)
         )
 
 
-def get_surgeries(profile_id):
+def get_surgeries(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM surgeries WHERE profile_id = %s ORDER BY surgery_date IS NULL, surgery_date DESC",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT s.* FROM surgeries s JOIN profiles p ON p.id = s.profile_id
+            WHERE s.profile_id = %s AND p.owner_id = %s
+            ORDER BY s.surgery_date IS NULL, s.surgery_date DESC
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_surgery(surgery_id, surgery_name, surgery_date, notes):
+def update_surgery(surgery_id, surgery_name, surgery_date, notes, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE surgeries SET surgery_name=%s, surgery_date=%s, notes=%s WHERE id=%s",
-            (surgery_name, surgery_date, notes, surgery_id)
-        )
+        conn.execute("""
+            UPDATE surgeries SET surgery_name=%s, surgery_date=%s, notes=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (surgery_name, surgery_date, notes, surgery_id, owner_id))
 
 
-def delete_surgery(surgery_id):
+def delete_surgery(surgery_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM surgeries WHERE id = %s", (surgery_id,))
+        conn.execute("""
+            DELETE FROM surgeries WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (surgery_id, owner_id))
 
 
 # ---------- Vet visits (history) ----------
 
-def add_vet_visit(profile_id, visit_date, reason, notes):
+def add_vet_visit(profile_id, visit_date, reason, notes, owner_id):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO vet_visits (profile_id, visit_date, reason, notes) VALUES (%s,%s,%s,%s)",
-            (profile_id, visit_date, reason, notes)
+            """INSERT INTO vet_visits (profile_id, visit_date, reason, notes)
+               SELECT %s,%s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, visit_date, reason, notes, profile_id, owner_id)
         )
 
 
-def get_vet_visits(profile_id):
+def get_vet_visits(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM vet_visits WHERE profile_id = %s ORDER BY visit_date IS NULL, visit_date DESC",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT vv.* FROM vet_visits vv JOIN profiles p ON p.id = vv.profile_id
+            WHERE vv.profile_id = %s AND p.owner_id = %s
+            ORDER BY vv.visit_date IS NULL, vv.visit_date DESC
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_vet_visit(visit_id, visit_date, reason, notes):
+def update_vet_visit(visit_id, visit_date, reason, notes, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE vet_visits SET visit_date=%s, reason=%s, notes=%s WHERE id=%s",
-            (visit_date, reason, notes, visit_id)
-        )
+        conn.execute("""
+            UPDATE vet_visits SET visit_date=%s, reason=%s, notes=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (visit_date, reason, notes, visit_id, owner_id))
 
 
-def delete_vet_visit(visit_id):
+def delete_vet_visit(visit_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM vet_visits WHERE id = %s", (visit_id,))
+        conn.execute("""
+            DELETE FROM vet_visits WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (visit_id, owner_id))
 
 
-# ---------- Vets (shared directory) ----------
+# ---------- Vets (per-owner directory) ----------
 
-def create_vet(vet_name, clinic_name, phone, address, notes):
+def create_vet(vet_name, clinic_name, phone, address, notes, owner_id):
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO vets (vet_name, clinic_name, phone, address, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-            (vet_name, clinic_name, phone, address, notes)
+            "INSERT INTO vets (vet_name, clinic_name, phone, address, notes, owner_id) "
+            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+            (vet_name, clinic_name, phone, address, notes, owner_id)
         )
         return cur.fetchone()["id"]
 
 
-def get_all_vets():
+def get_all_vets(owner_id):
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM vets ORDER BY LOWER(vet_name)").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM vets WHERE owner_id = %s ORDER BY LOWER(vet_name)", (owner_id,)
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_vet(vet_id):
+def get_vet(vet_id, owner_id):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM vets WHERE id = %s", (vet_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM vets WHERE id = %s AND owner_id = %s", (vet_id, owner_id)
+        ).fetchone()
         return dict(row) if row else None
 
 
-def update_vet(vet_id, vet_name, clinic_name, phone, address, notes):
+def update_vet(vet_id, vet_name, clinic_name, phone, address, notes, owner_id):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE vets SET vet_name=%s, clinic_name=%s, phone=%s, address=%s, notes=%s WHERE id=%s",
-            (vet_name, clinic_name, phone, address, notes, vet_id)
+            "UPDATE vets SET vet_name=%s, clinic_name=%s, phone=%s, address=%s, notes=%s "
+            "WHERE id=%s AND owner_id=%s",
+            (vet_name, clinic_name, phone, address, notes, vet_id, owner_id)
         )
 
 
-def delete_vet(vet_id):
+def delete_vet(vet_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM vets WHERE id = %s", (vet_id,))
+        conn.execute("DELETE FROM vets WHERE id = %s AND owner_id = %s", (vet_id, owner_id))
 
 
-def link_vet_to_profile(profile_id, vet_id, is_primary=False):
+def link_vet_to_profile(profile_id, vet_id, owner_id, is_primary=False):
     """Links a vet to a profile. If this vet is already linked to this profile, promotes
-    it to primary if requested instead of creating a duplicate link."""
+    it to primary if requested instead of creating a duplicate link. Both the profile and
+    the vet must belong to the calling owner -- checked explicitly rather than trusted,
+    even though the UI only ever offers same-owner candidates for both."""
     with get_conn() as conn:
+        owns_profile = conn.execute(
+            "SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s", (profile_id, owner_id)
+        ).fetchone()
+        owns_vet = conn.execute(
+            "SELECT 1 FROM vets WHERE id = %s AND owner_id = %s", (vet_id, owner_id)
+        ).fetchone()
+        if not owns_profile or not owns_vet:
+            raise PawfolioDBError("Couldn't link that vet.")
         existing = conn.execute(
             "SELECT id FROM profile_vets WHERE profile_id = %s AND vet_id = %s",
             (profile_id, vet_id)
@@ -627,18 +763,29 @@ def link_vet_to_profile(profile_id, vet_id, is_primary=False):
         return cur.fetchone()["id"]
 
 
-def unlink_vet_from_profile(profile_vet_id):
+def unlink_vet_from_profile(profile_vet_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM profile_vets WHERE id = %s", (profile_vet_id,))
+        conn.execute("""
+            DELETE FROM profile_vets WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (profile_vet_id, owner_id))
 
 
-def set_primary_vet(profile_id, profile_vet_id):
+def set_primary_vet(profile_id, profile_vet_id, owner_id):
     with get_conn() as conn:
+        owns_profile = conn.execute(
+            "SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s", (profile_id, owner_id)
+        ).fetchone()
+        if not owns_profile:
+            raise PawfolioDBError("Couldn't update that vet link.")
         conn.execute("UPDATE profile_vets SET is_primary = 0 WHERE profile_id = %s", (profile_id,))
-        conn.execute("UPDATE profile_vets SET is_primary = 1 WHERE id = %s", (profile_vet_id,))
+        conn.execute(
+            "UPDATE profile_vets SET is_primary = 1 WHERE id = %s AND profile_id = %s",
+            (profile_vet_id, profile_id)
+        )
 
 
-def get_vets_for_profile(profile_id):
+def get_vets_for_profile(profile_id, owner_id):
     """Vets linked to this profile, joined with vet details. Primary vet first."""
     with get_conn() as conn:
         rows = conn.execute("""
@@ -646,109 +793,129 @@ def get_vets_for_profile(profile_id):
                    vets.id AS vet_id, vets.vet_name, vets.clinic_name, vets.phone,
                    vets.address, vets.notes
             FROM profile_vets
+            JOIN profiles p ON p.id = profile_vets.profile_id
             JOIN vets ON vets.id = profile_vets.vet_id
-            WHERE profile_vets.profile_id = %s
+            WHERE profile_vets.profile_id = %s AND p.owner_id = %s
             ORDER BY profile_vets.is_primary DESC, LOWER(vets.vet_name)
-        """, (profile_id,)).fetchall()
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
 # ---------- Baths ----------
 
-def add_bath(profile_id, bath_date, next_due_date):
+def add_bath(profile_id, bath_date, next_due_date, owner_id):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO baths (profile_id, bath_date, next_due_date) VALUES (%s,%s,%s)",
-            (profile_id, bath_date, next_due_date)
+            """INSERT INTO baths (profile_id, bath_date, next_due_date)
+               SELECT %s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, bath_date, next_due_date, profile_id, owner_id)
         )
 
 
-def get_baths(profile_id):
+def get_baths(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM baths WHERE profile_id = %s ORDER BY next_due_date IS NULL, next_due_date DESC",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT b.* FROM baths b JOIN profiles p ON p.id = b.profile_id
+            WHERE b.profile_id = %s AND p.owner_id = %s
+            ORDER BY b.next_due_date IS NULL, b.next_due_date DESC
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_bath(bath_id, bath_date, next_due_date):
+def update_bath(bath_id, bath_date, next_due_date, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE baths SET bath_date=%s, next_due_date=%s WHERE id=%s",
-            (bath_date, next_due_date, bath_id)
-        )
+        conn.execute("""
+            UPDATE baths SET bath_date=%s, next_due_date=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (bath_date, next_due_date, bath_id, owner_id))
 
 
-def delete_bath(bath_id):
+def delete_bath(bath_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM baths WHERE id = %s", (bath_id,))
+        conn.execute("""
+            DELETE FROM baths WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (bath_id, owner_id))
 
 
 # ---------- Food refills ----------
 
-def add_food_refill(profile_id, food_type, last_refill_date, next_refill_date):
+def add_food_refill(profile_id, food_type, last_refill_date, next_refill_date, owner_id):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO food_refills (profile_id, food_type, last_refill_date, next_refill_date) VALUES (%s,%s,%s,%s)",
-            (profile_id, food_type, last_refill_date, next_refill_date)
+            """INSERT INTO food_refills (profile_id, food_type, last_refill_date, next_refill_date)
+               SELECT %s,%s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, food_type, last_refill_date, next_refill_date, profile_id, owner_id)
         )
 
 
-def get_food_refills(profile_id):
+def get_food_refills(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM food_refills WHERE profile_id = %s ORDER BY next_refill_date IS NULL, next_refill_date DESC",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT fr.* FROM food_refills fr JOIN profiles p ON p.id = fr.profile_id
+            WHERE fr.profile_id = %s AND p.owner_id = %s
+            ORDER BY fr.next_refill_date IS NULL, fr.next_refill_date DESC
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_food_refill(refill_id, food_type, last_refill_date, next_refill_date):
+def update_food_refill(refill_id, food_type, last_refill_date, next_refill_date, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE food_refills SET food_type=%s, last_refill_date=%s, next_refill_date=%s WHERE id=%s",
-            (food_type, last_refill_date, next_refill_date, refill_id)
-        )
+        conn.execute("""
+            UPDATE food_refills SET food_type=%s, last_refill_date=%s, next_refill_date=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (food_type, last_refill_date, next_refill_date, refill_id, owner_id))
 
 
-def delete_food_refill(refill_id):
+def delete_food_refill(refill_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM food_refills WHERE id = %s", (refill_id,))
+        conn.execute("""
+            DELETE FROM food_refills WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (refill_id, owner_id))
 
 
 # ---------- Boarding stays (history) ----------
 
-def add_boarding_stay(profile_id, facility_name, check_in_date, check_out_date, notes):
+def add_boarding_stay(profile_id, facility_name, check_in_date, check_out_date, notes, owner_id):
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO boarding_stays (profile_id, facility_name, check_in_date, check_out_date, notes)
-               VALUES (%s,%s,%s,%s,%s)""",
-            (profile_id, facility_name, check_in_date, check_out_date, notes)
+               SELECT %s,%s,%s,%s,%s WHERE EXISTS (
+                   SELECT 1 FROM profiles WHERE id = %s AND owner_id = %s
+               )""",
+            (profile_id, facility_name, check_in_date, check_out_date, notes, profile_id, owner_id)
         )
 
 
-def get_boarding_stays(profile_id):
+def get_boarding_stays(profile_id, owner_id):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM boarding_stays WHERE profile_id = %s ORDER BY check_in_date IS NULL, check_in_date DESC",
-            (profile_id,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT bs.* FROM boarding_stays bs JOIN profiles p ON p.id = bs.profile_id
+            WHERE bs.profile_id = %s AND p.owner_id = %s
+            ORDER BY bs.check_in_date IS NULL, bs.check_in_date DESC
+        """, (profile_id, owner_id)).fetchall()
         return [dict(r) for r in rows]
 
 
-def update_boarding_stay(stay_id, facility_name, check_in_date, check_out_date, notes):
+def update_boarding_stay(stay_id, facility_name, check_in_date, check_out_date, notes, owner_id):
     with get_conn() as conn:
-        conn.execute(
-            """UPDATE boarding_stays SET facility_name=%s, check_in_date=%s, check_out_date=%s, notes=%s
-               WHERE id=%s""",
-            (facility_name, check_in_date, check_out_date, notes, stay_id)
-        )
+        conn.execute("""
+            UPDATE boarding_stays SET facility_name=%s, check_in_date=%s, check_out_date=%s, notes=%s
+            WHERE id=%s AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (facility_name, check_in_date, check_out_date, notes, stay_id, owner_id))
 
 
-def delete_boarding_stay(stay_id):
+def delete_boarding_stay(stay_id, owner_id):
     with get_conn() as conn:
-        conn.execute("DELETE FROM boarding_stays WHERE id = %s", (stay_id,))
+        conn.execute("""
+            DELETE FROM boarding_stays WHERE id = %s
+            AND profile_id IN (SELECT id FROM profiles WHERE owner_id=%s)
+        """, (stay_id, owner_id))
 
 
 # ---------- Dashboard helpers ----------
@@ -798,40 +965,51 @@ def _next_annual_occurrence(iso_date: str, today: date):
     return days_until, age_turning
 
 
-def get_upcoming_events(horizon_days: int = 30):
-    """Gather all upcoming/overdue events across every profile, sorted soonest/most overdue first.
+def get_upcoming_events(owner_id: str, horizon_days: int = 30):
+    """Gather all upcoming/overdue events across every one of this owner's profiles,
+    sorted soonest/most overdue first.
 
-    Fetches each record type once across every profile (6 queries total) rather than once
-    per profile per type (6 x N queries) -- against local SQLite that distinction was free,
-    but against hosted Postgres each query is a real network round-trip, so the old
-    per-profile-per-type loop turned a 3-profile dashboard into ~19 round-trips and a
-    20-profile one into ~120. Grouping happens in Python afterward via profiles_by_id
-    instead of in the query, so every event's shape and the horizon/ongoing/linked-friend
-    filtering rules below are unchanged from the per-profile version this replaced."""
+    Fetches each record type once across all of this owner's profiles (6 queries total)
+    rather than once per profile per type (6 x N queries) -- against local SQLite that
+    distinction was free, but against hosted Postgres each query is a real network
+    round-trip, so the old per-profile-per-type loop turned a 3-profile dashboard into ~19
+    round-trips and a 20-profile one into ~120. Grouping happens in Python afterward via
+    profiles_by_id instead of in the query, so every event's shape and the
+    horizon/ongoing/linked-friend filtering rules below are unchanged from the per-profile
+    version this replaced. The owner filter is applied at the SQL level (JOIN through
+    profiles) on all six bulk queries, not just relied on implicitly via profiles_by_id
+    only containing this owner's profiles -- keeps other owners' rows out of process
+    memory entirely rather than fetching-then-discarding them."""
     events = []
     today = date.today()
-    profiles = get_all_profiles()
+    profiles = get_all_profiles(owner_id)
     profiles_by_id = {p["id"]: p for p in profiles}
 
     with get_conn() as conn:
-        all_vaccinations = conn.execute(
-            "SELECT * FROM vaccinations WHERE next_due_date IS NOT NULL"
-        ).fetchall()
-        all_medications = conn.execute(
-            "SELECT * FROM medications WHERE ongoing = 0 AND end_date IS NOT NULL"
-        ).fetchall()
-        all_friends = conn.execute(
-            "SELECT * FROM friends WHERE friend_profile_id IS NULL AND friend_birthday IS NOT NULL"
-        ).fetchall()
-        all_baths = conn.execute(
-            "SELECT * FROM baths WHERE next_due_date IS NOT NULL"
-        ).fetchall()
-        all_food_refills = conn.execute(
-            "SELECT * FROM food_refills WHERE next_refill_date IS NOT NULL"
-        ).fetchall()
-        all_boarding_stays = conn.execute(
-            "SELECT * FROM boarding_stays WHERE check_in_date IS NOT NULL"
-        ).fetchall()
+        all_vaccinations = conn.execute("""
+            SELECT v.* FROM vaccinations v JOIN profiles p ON p.id = v.profile_id
+            WHERE v.next_due_date IS NOT NULL AND p.owner_id = %s
+        """, (owner_id,)).fetchall()
+        all_medications = conn.execute("""
+            SELECT m.* FROM medications m JOIN profiles p ON p.id = m.profile_id
+            WHERE m.ongoing = 0 AND m.end_date IS NOT NULL AND p.owner_id = %s
+        """, (owner_id,)).fetchall()
+        all_friends = conn.execute("""
+            SELECT f.* FROM friends f JOIN profiles p ON p.id = f.profile_id
+            WHERE f.friend_profile_id IS NULL AND f.friend_birthday IS NOT NULL AND p.owner_id = %s
+        """, (owner_id,)).fetchall()
+        all_baths = conn.execute("""
+            SELECT b.* FROM baths b JOIN profiles p ON p.id = b.profile_id
+            WHERE b.next_due_date IS NOT NULL AND p.owner_id = %s
+        """, (owner_id,)).fetchall()
+        all_food_refills = conn.execute("""
+            SELECT fr.* FROM food_refills fr JOIN profiles p ON p.id = fr.profile_id
+            WHERE fr.next_refill_date IS NOT NULL AND p.owner_id = %s
+        """, (owner_id,)).fetchall()
+        all_boarding_stays = conn.execute("""
+            SELECT bs.* FROM boarding_stays bs JOIN profiles p ON p.id = bs.profile_id
+            WHERE bs.check_in_date IS NOT NULL AND p.owner_id = %s
+        """, (owner_id,)).fetchall()
 
     for v in all_vaccinations:
         p = profiles_by_id.get(v["profile_id"])
@@ -1001,7 +1179,9 @@ def get_already_notified_keys():
     """Set of (event_type, record_id, state_key, milestone) already included in a
     previously-sent digest. state_key/milestone computation lives in notifications.py, not
     here — this is plain storage, no domain logic about what counts as "the same" due item
-    or which countdown checkpoint it's at."""
+    or which countdown checkpoint it's at. No owner_id needed: record_id is a globally
+    unique id from its own source table, so two different owners' events can never
+    collide on the same dedup key."""
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT event_type, record_id, state_key, milestone FROM notified_events"
@@ -1027,17 +1207,32 @@ def mark_events_notified(keys):
             )
 
 
-def was_digest_sent_today():
+def was_digest_sent_today(owner_id: str):
     today = date.today().isoformat()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS c FROM notification_log WHERE sent_at LIKE %s", (f"{today}%",)
+            "SELECT COUNT(*) AS c FROM notification_log WHERE owner_id = %s AND sent_at LIKE %s",
+            (owner_id, f"{today}%")
         ).fetchone()
         return row["c"] > 0
 
 
-def record_digest_sent():
+def record_digest_sent(owner_id: str):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO notification_log (sent_at) VALUES (%s)", (datetime.now().isoformat(),)
+            "INSERT INTO notification_log (owner_id, sent_at) VALUES (%s, %s)",
+            (owner_id, datetime.now().isoformat())
         )
+
+
+# ---------- Users (for admin/migration use, e.g. one-time owner backfill) ----------
+
+def list_auth_users():
+    """Every Supabase Auth user's id/email, straight from the auth schema our direct
+    Postgres connection already has access to. Not used by the app itself at runtime --
+    only by one-time migration scripts (see migrate_add_owner.py) that need to find a
+    user's id to backfill existing ownerless rows, without asking for a UUID to be
+    copy-pasted by hand."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT id, email, created_at FROM auth.users ORDER BY created_at").fetchall()
+        return [dict(r) for r in rows]

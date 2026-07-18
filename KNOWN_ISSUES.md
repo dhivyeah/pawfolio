@@ -670,3 +670,348 @@ known state, not something to silently fix here — flagged below so it's tracke
   correct content every time it was tested — just a missed opportunity to keep the warm,
   quirky voice going through the wait instead of a generic loading placeholder.
 - **Location:** No explicit `st.spinner()`/loading copy anywhere in `views/home.py` or `app.py`.
+
+## Phase 4 Auth Review — 2026-07-18
+
+Added Supabase Auth (email/password) and per-user `owner_id` data scoping, closing the
+"anyone with the URL can edit my data" gap. Migrated to Supabase Storage for photos (private
+bucket + RLS, server-side download instead of literal signed URLs — see note below). Data
+isolation was tested directly, both automated and against the real production schema; the
+items below are what's still open, per the requested review pass, not fixed silently.
+
+### Note: "private + signed URLs" was requested, but photos are served a different way
+
+- **Not a bug** — flagging so the actual mechanism is understood, since it doesn't literally
+  match what was asked for by name. Photos live in a **private** Storage bucket protected by
+  Row Level Security (each user can only read/write their own `{owner_id}/...` folder), which
+  matches the "private" half of the request. But rather than generating a signed URL (a
+  temporary public link with an expiry), the app fetches photo bytes server-side through an
+  authenticated, request-scoped Supabase client and embeds them directly as base64 `data:`
+  URIs in the page — the same technique already used for every image in this app since photos
+  were only ever local files. Net effect is equal-or-stronger privacy (there's never a
+  fetchable URL for a photo at all, signed or otherwise, so nothing can leak via a shared link
+  or browser history) without signed-URL expiry/regeneration complexity. Worth knowing in case
+  a future feature (e.g. public sharing) specifically needs a real shareable URL — that would
+  need signed URLs added on top of this, not a replacement for it.
+- **Location:** `photo_storage.py` (`get_photo_bytes`), `ui_helpers.py` (`_image_data_uri`).
+
+### Issue: Signing up with an already-registered email shows a misleading "success" message
+
+- **Severity:** Medium
+- **Steps to reproduce:** Sign up with an email that already has a confirmed Pawfolio account
+  (tested directly against the real account created for this migration).
+- **Expected vs. actual:** Expected either an error ("that email already has an account") or a
+  clear message. Actual: Supabase's signup API deliberately returns a success-shaped response
+  for this case (`needs_confirmation: true`, no error) — this is intentional anti-enumeration
+  behavior on Supabase's part, so an attacker can't probe which emails are registered by
+  comparing error messages, and it's working correctly for that purpose. But the app's copy
+  takes that response at face value and tells the user "🐾 Account created! Check your email
+  for a confirmation link" — no account was created and (in most Supabase configurations) no
+  email is sent, so a real user who forgot they'd already signed up is told to go check an
+  email that isn't coming, then gets a confusing "incorrect password" if they try to log in
+  with the new password they just chose. Does not leak security info (that part is fine by
+  design) — purely a misleading-copy problem for a legitimate confused user.
+- **Location:** `login_ui.py`, the `success and info["needs_confirmation"]` branch — can't
+  actually distinguish "brand-new signup, awaiting confirmation" from "email already existed"
+  using what `auth.sign_up()` currently returns from Supabase's API.
+
+### Issue: No forgotten-password / password-reset flow anywhere in the UI
+
+- **Severity:** High
+- **Steps to reproduce:** Forget your password. Look for a way to recover the account from the
+  login screen.
+- **Expected vs. actual:** Expected a "Forgot password?" link sending a reset email (Supabase
+  Auth supports this natively via `auth.reset_password_for_email()`). Actual: no such link or
+  flow exists anywhere in `login_ui.py`. A locked-out user has no self-service path back into
+  their own data — the only recovery today is a manual reset from the Supabase project
+  dashboard, which isn't something an end user can do themselves.
+- **Location:** `login_ui.py` (missing entirely), `auth.py` (no `reset_password` wrapper).
+- **Fixed 2026-07-18:** Added a "Forgot password?" expander on the login tab
+  (`auth.request_password_reset`) that emails a reset link without revealing whether the
+  address has an account (matches Supabase's own anti-enumeration behavior — deliberately
+  doesn't repeat the duplicate-signup mistake above). This Supabase project uses the
+  "implicit" auth flow, so the link actually redirects back with the session tokens in the
+  URL *fragment* (`#access_token=...&type=recovery`), not the query string — fragments never
+  reach the server, so `st.query_params` can't see them directly. Discovered this by testing
+  end-to-end against a real inbox (first attempt, built against the `token_hash`/query-string
+  flow, landed back on a plain login page instead of the reset form). Fixed with a small
+  client-side JS shim in `app.py` (`streamlit.components.v1.html`) that reads
+  `window.parent.location.hash` and rewrites the URL to carry the same values as query
+  params, which `st.query_params` then reads to hand off to `render_password_reset()`. That
+  screen sets the session and new password together in one step
+  (`auth.complete_password_reset`, now taking `access_token`/`refresh_token` directly rather
+  than a `token_hash` needing a separate exchange), using a throwaway Supabase client scoped
+  to just that call rather than the shared module-level one — `update_user()` needs a real
+  saved session in the client instance itself (no way to pass it a bearer token directly,
+  unlike the Storage calls), and reusing the shared client would risk one browser session's
+  recovery bleeding into another's concurrent login. **Not yet confirmed end-to-end with the
+  corrected code** — the first live click-through (before the fragment fix) landed on a plain
+  login page instead of the reset form, which is what surfaced the fragment/query-string bug
+  in the first place; a second attempt after the fix hit Supabase's own rate limit before
+  reaching the email. Re-test once the rate limit clears: request a reset, click the email
+  link, confirm it lands on "Set a new password" rather than back on login. **One manual step
+  still required for production:** the reset link's target
+  (`APP_URL`, defaults to `https://mypawfolio.streamlit.app`) must be on this Supabase
+  project's Redirect URLs allow-list (Authentication → URL Configuration in the dashboard),
+  or Supabase silently redirects somewhere else instead. **Minor tradeoff worth knowing:**
+  moving the tokens from fragment to query string means they briefly appear in a form that
+  *is* sent to the server (query strings, unlike fragments, are included in the HTTP
+  request) — low risk for a short-lived, single-use, immediately-consumed token against a
+  server that isn't logging full request paths, but worth remembering if request logging is
+  ever added.
+
+### Issue: Login session never refreshes and doesn't survive a browser refresh
+
+- **Severity:** Medium
+- **Details:** Two related gaps found while testing session persistence:
+  1. `auth.sign_in()` stores only the short-lived `access_token` in `st.session_state`,
+     discarding Supabase's `refresh_token` entirely. Supabase access tokens commonly expire
+     around an hour. Nothing in the app re-authenticates or refreshes after that — regular
+     dog-profile data keeps working fine the whole time (it goes straight to Postgres via
+     `db.py`, independent of the Supabase Auth session), but photo operations specifically
+     start failing once the token expires: `photo_storage.get_photo_bytes()` catches the
+     error and quietly returns `None` (an existing photo just stops rendering, no message),
+     while `photo_storage.upload_photo()` has no error handling at all, so uploading or
+     replacing a photo past that point would surface as an unhandled exception rather than a
+     friendly message. A user would see "everything else still works but photos broke" with
+     no indication why or how to fix it (short of logging out and back in).
+  2. Separately, a plain browser refresh (not just long idle time) also logs the user out
+     immediately — `st.session_state` is in-memory per Streamlit session with nothing
+     persisted to a cookie or `localStorage`, so reloading the tab seconds after logging in
+     lands back on the login screen. This came up directly while testing today (a stray
+     background process on the same port made a refresh necessary, and required logging in
+     again from scratch).
+- **Location:** `auth.py` (`sign_in()` — no `refresh_token` captured or used anywhere),
+  `photo_storage.py` (`upload_photo()` has no try/except, unlike `get_photo_bytes()` and
+  `delete_photo()`), `app.py`/`login_ui.py` (session lives only in `st.session_state`, no
+  persistence layer).
+
+### Verified: cross-user data isolation (mostly — see correction below)
+
+- **Not a bug** — confirmed working for every profile/vet/child-record query, noting it
+  explicitly since it was the core ask for this phase. Checked two ways: (1) four dedicated
+  automated tests exercising `get_all_profiles`, `update_profile`, `delete_profile`, and
+  `get_upcoming_events` with a second owner's data present, all passing; (2) directly against
+  the real production schema — after migrating the 5 existing profiles and 1 vet to the real
+  account's `owner_id`, `get_all_profiles()` and `get_all_vets()` scoped to that `owner_id`
+  return exactly those records and nothing else.
+- **Correction (2026-07-18 full test pass):** the claim "no query anywhere in `db.py` omits
+  the `owner_id` filter" written here originally turned out to be wrong — see the "Cross-owner
+  data leak via friend-linking" finding below, found during a full Phase 1–4 regression pass.
+  One relationship (`friends.friend_profile_id`) does not get the same defense-in-depth
+  ownership check every other cross-reference (siblings, vet links) already has. Leaving this
+  note in place rather than quietly rewriting history, since the original claim was tested
+  incompletely — it checked the tables directly, not every JOIN across tables.
+
+## Full Phase 1–4 Regression Pass — 2026-07-18
+
+End-to-end test pass across everything built so far: core CRUD (Phase 1), care/logistics,
+email notifications, hosted deployment, and multi-user accounts/data scoping (Phase 4).
+Testing only, per instructions — nothing below was fixed as part of this pass. Covered: a
+full `db.py` audit (every query, checked for owner_id scoping), live cross-owner reproduction
+attempts (two real throwaway owner UUIDs, tried to read/edit/delete each other's data through
+every write/read function, and through session_state tampering — the closest equivalent to
+URL manipulation in this app's architecture, since profile selection is never driven by a URL
+query param anywhere in the codebase), the full automated test suite, and a code-level review
+of session/login edge cases and mobile CSS. No browser automation tool is available in this
+environment, so mobile responsiveness could only be reviewed at the CSS level, not visually
+confirmed on an actual small screen — flagged below rather than silently assumed fine.
+
+### Issue: Cross-owner data leak via friend-linking
+
+- **Severity:** High — **FIXED 2026-07-18**
+- **Steps to reproduce:** Call `db.add_friend(profile_id, name, None, notes, owner_b,
+  friend_profile_id=<a profile_id owned by owner_a>)`, then `db.get_friends(profile_id,
+  owner_b)`.
+- **Expected vs. actual:** Expected `add_friend` to reject linking to a profile it doesn't
+  own, the same way `add_sibling` (checks both profiles belong to the caller before creating
+  the link) and `link_vet_to_profile` (checks both the profile and the vet) already do.
+  Actual, reproduced directly: `add_friend` only verifies the profile being added *to*, never
+  the linked `friend_profile_id`. The insert succeeds, and every subsequent `get_friends()`
+  call for that profile then returns the other owner's dog's `linked_name`, `linked_dob`, and
+  `linked_photo_path` (a real Supabase Storage path, which also reveals the other owner's
+  Auth UUID as its folder prefix) — confirmed via a live reproduction against two real
+  throwaway owner ids, not just reasoning about the code.
+- **Why it's not currently exploitable through the app itself:** the "Add friend → link to an
+  existing pup" picker in `views/profile_detail.py` only ever offers candidates from
+  `get_all_profiles(owner_id)` — the current user's own dogs — so a normal user clicking
+  through the UI can never actually select another owner's profile to link. The gap is real at
+  the `db.py` layer, not reachable at the UI layer today. That said, it's the one place in the
+  whole data-access layer that relies on the *caller* (the UI) to have already done the
+  scoping, rather than enforcing it itself — every other similar cross-reference doesn't trust
+  the caller. Flagging as High rather than Critical because there's no live exploit path today
+  (would need direct DB access or a future caller that doesn't scope its own candidate list),
+  but it's a real gap in the core guarantee this whole phase was built around, not merely a
+  theoretical one — recommend treating it as a "fix before it matters" item rather than
+  deferring indefinitely.
+- **Location:** `db.py` — `add_friend()` (no ownership check on `friend_profile_id`) and
+  `get_friends()` (the `LEFT JOIN profiles lp` has no `lp.owner_id = %s` condition). Compare
+  to `add_sibling()`'s `owned_count != 2` check and `link_vet_to_profile()`'s `owns_profile`/
+  `owns_vet` checks for the pattern this should follow.
+- **Fixed 2026-07-18:** `add_friend()` now checks, before inserting, that `friend_profile_id`
+  (when provided) belongs to the same `owner_id` as `profile_id` — raises `PawfolioDBError`
+  otherwise, matching `add_sibling()`'s pattern exactly. `get_friends()`'s `LEFT JOIN` also
+  gained `AND lp.owner_id = p.owner_id` as a second, independent layer of defense on the read
+  side, so even a row that somehow got created without going through `add_friend()` (a future
+  migration script, manual DB edit, etc.) still can't surface another owner's name/photo/dob —
+  it would just fall back to showing the friend's name as it was at link time, the same
+  graceful fallback already used when a linked profile is deleted. Verified with a live
+  reproduction in an isolated test schema: the exact cross-owner call that leaked data before
+  now raises `PawfolioDBError("Couldn't link that profile as a friend.")`; a same-owner linked
+  friend and a freeform (non-linked) friend both still work exactly as before. Full test suite
+  re-run clean afterward (72 passed, same 6 pre-existing unrelated failures, no new ones).
+
+### Issue: Logging out doesn't clear `selected_profile_id`
+
+- **Severity:** Medium
+- **Steps to reproduce:** Log in as User A, open a specific dog's profile, log out, log in as
+  User B on the same browser session (shared device), and land on Profile Detail without
+  picking a dog first (e.g. it's still the active page from A's session).
+- **Expected vs. actual:** Expected either the normal "pick a profile" screen or a clean
+  redirect to Home. Actual, reproduced directly: User B sees "This profile no longer exists,"
+  since `selected_profile_id` still holds User A's profile id and `get_profile` correctly
+  returns nothing for User B's `owner_id` — **no data leaks** (confirmed: this is a UX
+  confusion finding, not a security one, the owner-scoping itself holds correctly here), but
+  it's a needlessly alarming message for someone who just logged in.
+- **Location:** `app.py`'s log-out handler only clears `auth_user` and `_notify_checked` from
+  `st.session_state`, not `selected_profile_id`.
+
+### Confirmed working: original "anyone with the URL" exposure gap is closed
+
+- **Not a bug.** `app.py` checks `st.session_state.get("auth_user")` and calls `st.stop()`
+  before any profile data is queried or any page (`Home`, `All the Pups`, `New Profile`,
+  `Profile`) can run — confirmed this check happens before `pg.run()`, and since Streamlit's
+  `st.navigation` model re-executes `app.py` from the top on *every* page navigation (there's
+  no separate URL route that skips app.py's own script body), there's no way to reach any view
+  file without passing this gate first. Confirmed live earlier in this same session: visiting
+  the app with no session produces only the login screen, nothing else.
+
+### Confirmed working: cross-owner rejection on every other write path
+
+- **Not a bug.** Live reproduction (two real throwaway owner ids) confirmed correct rejection
+  for: `add_sibling` (cross-owner link → `PawfolioDBError`), `link_vet_to_profile` (linking
+  another owner's vet → `PawfolioDBError`), `delete_vet` (cross-owner delete → silent no-op,
+  target vet still exists for its real owner), `unlink_vet_from_profile` (cross-owner unlink →
+  silent no-op, link still exists). Matches the existing automated tests
+  (`test_update_profile_ignores_other_owners_id`, `test_delete_profile_ignores_other_owners`,
+  etc.), extended here to the vet/sibling paths those tests didn't cover.
+
+### Confirmed working: session_state tampering (this app's equivalent of URL manipulation)
+
+- **Not a bug.** This architecture has no URL-query-param-driven navigation for profile
+  selection anywhere (`selected_profile_id` is only ever set from within the app's own click
+  handlers — confirmed via a full-codebase search), so the closest realistic attack is
+  tampering with `st.session_state` directly. Simulated via `AppTest`: logged in as owner B
+  with `selected_profile_id` forced to owner A's profile id. Result: "This profile no longer
+  exists," no data rendered — `get_profile`'s owner filter holds.
+
+### Confirmed working: per-user notification digest cap
+
+- **Not a bug.** `was_digest_sent_today`/`record_digest_sent` are correctly isolated per
+  owner — verified live that recording a digest as sent for owner A does not affect owner B's
+  independent "sent today" status. (No dedicated automated test exists for this specifically;
+  covered here by direct reproduction instead.)
+
+### Confirmed working: full regression suite, no new failures
+
+- **Not a bug.** `pytest tests/ -v` → 72 passed, 6 failed — the same 6 that were already
+  failing before any of today's changes, all pre-existing and unrelated (stale assertions
+  against a page layout from before the 2026-07-14 redesign — see the "Same exact 6
+  pre-existing failures" confirmation earlier in this file). Dashboard due-date logic, all
+  CRUD, and notification dedup logic are all exercised by this suite and all still pass with
+  the full owner_id scoping in place.
+
+### Not independently verified this pass: mobile responsiveness
+
+- **Severity:** N/A (testing gap, not a finding)
+- **Details:** No browser automation tool is available in this environment, so mobile
+  layout could only be reviewed at the CSS source level (`styles.py`'s `@media (max-width:
+  640px)` block), not visually confirmed on an actual narrow viewport. Phase 4 didn't touch
+  `styles.py` at all, and the new login/signup/reset screens use only standard Streamlit
+  primitives (`st.tabs`, `st.form`, `st.text_input`, `st.expander`) already covered by the
+  existing global button/heading rules — reasoned to be fine, not confirmed fine. Recommend
+  an actual phone/DevTools-narrow-viewport check of the login screen and the "Forgot
+  password?" expander specifically, since those are new since the last visual mobile pass.
+
+### Not independently verified this pass: password reset end-to-end click-through
+
+- **Severity:** N/A (testing gap, not a finding — tracked in detail in the Phase 4 Auth
+  Review section above)
+- **Details:** The fragment/query-string bug was caught and fixed, but the corrected version
+  hasn't been click-tested to completion yet — Supabase's rate limit was hit right after the
+  fix. Re-test once it clears.
+
+## Visual Polish Pass — Dashboard & Profile Due-Dates — 2026-07-18
+
+Applied the requested layout/color treatment to the dashboard and profile-detail health
+section: a 2-column responsive grid for the dashboard's Upcoming feed, icon circles + urgency
+badges on every card, and the same treatment extended to the profile page's due-date rows
+(vaccinations, non-ongoing medications, baths, food refills, boarding check-ins,
+registration). Tag pills for likes/dislikes/toys/foods turned out to already be implemented
+(`ui_helpers.show_tag_pills`, already applied everywhere those fields display) — nothing to
+change there. Presentation only, per instructions: no changes to `db.py`, CRUD logic, auth,
+or notification logic. Full test suite re-run clean after every step (72 passed, same 6
+pre-existing unrelated failures, no new ones — including one additional flaky failure,
+`test_app_home_loads_without_exception`, seen twice under full-suite load but passing every
+time in isolation; looks like test-suite connection-pool contention, not a real issue, but
+noting it since it's new *noise* even if not a new *failure*).
+
+### Choice: Font Awesome (CDN) instead of emoji for icon circles
+
+- Explicitly chosen over emoji when asked directly, on the condition it's free — it is (the
+  Free tier, loaded from cdnjs.cloudflare.com, no account or API key needed, no cost). This is
+  a deliberate departure from this codebase's usual no-external-dependency default (inline SVG
+  mascot, base64-embedded photos, no other CDN resources anywhere) in favor of a sharper
+  "app-like" look for these specific icon circles.
+- **Not visually confirmed** — no browser automation tool is available in this environment, so
+  the `@import` actually resolving, the icon glyphs actually rendering, and their exact visual
+  weight next to the emoji used everywhere else on the page could only be reasoned about from
+  the CSS/HTML source, not seen. **Please check this first** — open the local app and confirm
+  the dashboard cards show real icon glyphs (syringe, droplet, cake, etc.), not empty circles
+  or a fallback box glyph. If the CDN import doesn't work for any reason (corporate firewall,
+  ad-blocker blocking cdnjs, offline use), every icon circle would silently show as a plain
+  colored circle with no glyph inside (Font Awesome's own missing-icon behavior, not a broken-
+  image icon or a crash) — degrades gracefully, but isn't invisible-if-broken the way the rest
+  of the app's zero-dependency approach otherwise guarantees.
+- **Location:** `styles.py` (the `@import` line, first rule in the stylesheet), `ui_helpers.py`
+  (`_TYPE_ICON`, `icon_circle_html`).
+
+### Fixed during this pass: gold-badge text contrast in dark mode
+
+- Caught during the review pass itself, fixed immediately rather than left open (small,
+  contained CSS-value change, not a design decision needing sign-off). The "This week" badge
+  and the food-refill icon circle both sit on `--pf-accent` (gold), which stays light-toned in
+  *both* light and dark mode by design (see `styles.py`'s `:root` vs `@media
+  (prefers-color-scheme: dark)` blocks) — using the theme-flipping `var(--pf-text)` for the
+  badge label, and a fixed near-white for the icon glyph, both meant light-colored text landed
+  on a light gold background in dark mode specifically (and was marginal even in light mode).
+  Fixed by giving both a fixed dark color (`#4A3225`) instead of following the theme variable —
+  correct in both modes now, since the gold background itself doesn't change between them.
+  Every other icon-circle/badge color pairing was checked the same way and found fine (their
+  backgrounds are dark/saturated enough in both modes for the fixed near-white to stay
+  readable) — this was the one exception.
+- **Location:** `ui_helpers.py` — `_TYPE_ICON["food_refill"]`'s icon color,
+  `urgency_badge_html()`'s `"week"` tier.
+
+### Scoping decision: "New Pack Members" cards left unchanged
+
+- The icon-circle/badge treatment was applied to the Upcoming feed and to due-date rows on the
+  profile page, per the instructions' explicit examples. "New Pack Members" cards (shown above
+  the Upcoming feed when a profile was added in the last 7 days) were deliberately left in
+  their original single-column layout with no icon circle — they're a celebration/announcement
+  card with no due date or urgency concept, not an "upcoming/status" item, so neither half of
+  the new pattern (type icon signaling *what kind* of due thing this is, urgency badge
+  signaling *how soon*) cleanly applies. Flagging the scoping choice explicitly in case a
+  celebratory 🎉 icon circle (no badge) is wanted there too for pure visual consistency across
+  the whole dashboard page — easy to add if so, just deliberately left out rather than
+  overreaching past what was actually asked for.
+
+### Not independently verified this pass: actual mobile rendering of the new grid
+
+- Same limitation as the Phase 1–4 regression pass above — no browser tool available, so the
+  2-column dashboard grid collapsing to 1 column on a narrow viewport could only be reasoned
+  about (it relies on Streamlit's existing `st.columns` auto-stacking behavior below the
+  established 640px breakpoint, already relied on elsewhere in `styles.py`), not seen. Also
+  worth an eye on the icon-circle + badge header row specifically at narrow widths — it's a
+  `display:flex; justify-content:space-between` row that hasn't been checked against a very
+  long urgency label (e.g. "14d overdue") on the smallest supported phone width.

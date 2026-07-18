@@ -1,7 +1,10 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from db import init_db, PawfolioDBError
 from styles import inject_theme
 from notifications import check_and_notify
+from login_ui import render_login_signup, render_password_reset
+import auth
 
 st.set_page_config(page_title="Pawfolio", page_icon="🐾", layout="wide")
 
@@ -11,6 +14,41 @@ st.set_page_config(page_title="Pawfolio", page_icon="🐾", layout="wide")
 # init_db()/check_and_notify() take a few real seconds against Postgres, the old ordering
 # left a window where the page could show unstyled/raw content while waiting on them.
 inject_theme(st)
+
+# This Supabase project uses the "implicit" auth flow, so a password-reset email's link
+# redirects back with the session tokens in the URL *fragment*
+# (#access_token=...&type=recovery), not the query string -- fragments are resolved
+# entirely client-side and never reach the server, so st.query_params can't see them
+# directly. This tiny script reads the fragment from the parent page (Streamlit components
+# render same-origin, so window.parent.location works) and, if it looks like a recovery
+# link, rewrites the URL to carry the same values as query params instead, which the
+# st.query_params check just below *can* read once the resulting reload happens.
+components.html(
+    """
+    <script>
+    (function() {
+        var hash = window.parent.location.hash;
+        if (hash && hash.indexOf("type=recovery") !== -1 && hash.indexOf("access_token=") !== -1) {
+            var params = new URLSearchParams(hash.substring(1));
+            var qs = new URLSearchParams({
+                type: "recovery",
+                access_token: params.get("access_token") || "",
+                refresh_token: params.get("refresh_token") || "",
+            });
+            window.parent.location.replace(window.parent.location.pathname + "?" + qs.toString());
+        }
+    })();
+    </script>
+    """,
+    height=0,
+)
+
+# Checked before anything else -- including the normal login gate -- since someone
+# completing a password reset is by definition not logged in yet, and doesn't need the
+# database touched at all to set a new password.
+if st.query_params.get("type") == "recovery" and st.query_params.get("access_token"):
+    render_password_reset(st.query_params["access_token"], st.query_params.get("refresh_token", ""))
+    st.stop()
 
 # Everything below that can touch the database is wrapped in one handler for
 # PawfolioDBError -- a Supabase project that's paused (free tier auto-pauses after a
@@ -31,12 +69,23 @@ try:
         init_db()
         st.session_state["_db_initialized"] = True
 
+    # Phase 4: everything past this point is per-user, so nothing past it can run until
+    # someone's actually logged in. render_login_signup() replaces the whole app chrome
+    # (no top nav, no dashboard) rather than being one more page inside it -- st.stop()
+    # right after means nothing below this block executes on an unauthenticated load.
+    if not st.session_state.get("auth_user"):
+        render_login_signup()
+        st.stop()
+
+    owner_id = st.session_state["auth_user"]["user_id"]
+    user_email = st.session_state["auth_user"]["email"]
+
     # "On app load" means once per browser session, not once per rerun -- app.py
     # re-executes top to bottom on every widget interaction anywhere in the app
     # (Streamlit's normal execution model), so an unconditional call here would
     # re-check on every single click.
     if not st.session_state.get("_notify_checked"):
-        check_and_notify()
+        check_and_notify(owner_id, user_email)
         st.session_state["_notify_checked"] = True
 
     home_page = st.Page("views/home.py", title="Home", icon="🏠", default=True)
@@ -49,17 +98,23 @@ try:
         position="hidden",
     )
 
-    # Top icon nav: Home and All the Pups only. "New Profile" lives as a button on the
-    # Home dashboard instead of the nav, and Profile Detail is only reached by clicking
-    # a dog — neither belongs in this bar.
+    # Top icon nav: Home, All the Pups, and (right-aligned) log out. "New Profile" lives
+    # as a button on the Home dashboard instead of the nav, and Profile Detail is only
+    # reached by clicking a dog — neither belongs in this bar.
     with st.container(key="top_nav"):
-        nav_cols = st.columns([1, 1, 14])
+        nav_cols = st.columns([1, 1, 11, 2])
         with nav_cols[0]:
             if st.button("🏠", key="nav_home", help="Home"):
                 st.switch_page(home_page)
         with nav_cols[1]:
             if st.button("🐾🐾", key="nav_profiles", help="All the Pups"):
                 st.switch_page(all_profiles_page)
+        with nav_cols[3]:
+            if st.button("🚪 Log out", key="nav_logout", help=f"Logged in as {user_email}"):
+                auth.sign_out()
+                for key in ("auth_user", "_notify_checked"):
+                    st.session_state.pop(key, None)
+                st.rerun()
 
     st.divider()
 

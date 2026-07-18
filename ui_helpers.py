@@ -1,41 +1,37 @@
 """Small shared UI utilities used across pages."""
 import os
-import uuid
 import base64
+from datetime import date, datetime
 import streamlit as st
-from db import PHOTOS_DIR, get_all_vets, create_vet, link_vet_to_profile, get_vets_for_profile, \
+from db import get_all_vets, create_vet, link_vet_to_profile, get_vets_for_profile, \
     unlink_vet_from_profile, set_primary_vet
+import photo_storage
 
 PLACEHOLDER_EMOJI = "🐶"
 
 _MIME_BY_EXT = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".webp": "webp"}
 
 
+def _current_access_token() -> str:
+    return st.session_state.get("auth_user", {}).get("access_token")
+
+
 def save_uploaded_photo(uploaded_file) -> str:
-    """Save a Streamlit UploadedFile to /photos and return the relative path, or None."""
+    """Upload a Streamlit UploadedFile to this user's Supabase Storage folder and
+    return its storage path (stored in profiles.photo_path), or None."""
     if uploaded_file is None:
         return None
-    ext = os.path.splitext(uploaded_file.name)[1] or ".jpg"
-    fname = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(PHOTOS_DIR, fname)
-    with open(dest, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return os.path.join("photos", fname)
+    auth_user = st.session_state.get("auth_user")
+    return photo_storage.upload_photo(uploaded_file, auth_user["user_id"], auth_user["access_token"])
 
 
-def photo_abs_path(photo_path: str) -> str:
-    if not photo_path:
+def _image_data_uri(photo_path: str) -> str:
+    photo_bytes = photo_storage.get_photo_bytes(photo_path, _current_access_token())
+    if photo_bytes is None:
         return None
-    base = os.path.dirname(os.path.abspath(__file__))
-    full = os.path.join(base, photo_path)
-    return full if os.path.exists(full) else None
-
-
-def _image_data_uri(abs_path: str) -> str:
-    ext = os.path.splitext(abs_path)[1].lower()
+    ext = os.path.splitext(photo_path)[1].lower()
     mime = _MIME_BY_EXT.get(ext, "jpeg")
-    with open(abs_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
+    b64 = base64.b64encode(photo_bytes).decode("ascii")
     return f"data:image/{mime};base64,{b64}"
 
 
@@ -47,7 +43,7 @@ def show_photo(photo_path: str, width: int = 150, height: int = None, responsive
     a stacked column is much wider than a fixed thumbnail. Pass max_width to cap how large
     it's allowed to grow (useful when the container can become the full phone width).
     shape="circle" for list/feed avatars, shape="rounded" (default) for larger detail-page images."""
-    abs_path = photo_abs_path(photo_path)
+    uri = _image_data_uri(photo_path) if photo_path else None
     if responsive:
         cap = f"max-width:{max_width}px;" if max_width else ""
         size_style = f"width:100%;{cap}aspect-ratio:1/1;"
@@ -59,8 +55,7 @@ def show_photo(photo_path: str, width: int = 150, height: int = None, responsive
 
     radius = "50%" if shape == "circle" else "24px"
 
-    if abs_path:
-        uri = _image_data_uri(abs_path)
+    if uri:
         st.markdown(
             f"<img src='{uri}' style='{size_style}object-fit:cover;"
             f"border-radius:{radius};display:block;border:2px solid var(--pf-border, #F0D9C0);' />",
@@ -149,6 +144,112 @@ def show_tag_pills(tags_str: str, empty_msg: str = "—"):
     st.markdown(pills, unsafe_allow_html=True)
 
 
+# ---------- Icon circles + urgency badges (dashboard cards, profile due-date rows) ----------
+# One shared source of truth for "what icon/color represents this kind of thing" so the
+# dashboard grid and the profile page's due-date rows can't visually drift apart from each
+# other over time. Icons are Font Awesome Free glyphs loaded via CDN (styles.py) rather than
+# emoji, per an explicit choice to prioritize a sharper "app-like" look here over this
+# codebase's usual no-external-dependency default (inline SVG mascot, base64-embedded
+# photos) -- see KNOWN_ISSUES.md for the tradeoff this brings (unverified in a real browser,
+# no fallback if the CDN is ever blocked).
+# Third element is the icon glyph's own color. Fixed near-white (#FFFBF5) works for every
+# background here except --pf-accent (gold) -- it stays light-toned in both light *and*
+# dark mode (see styles.py), so white-on-gold reads as low-contrast in both, not just one.
+# food_refill gets a fixed dark color instead, the one case that needs it.
+_TYPE_ICON = {
+    "vaccination": ("fa-syringe", "var(--pf-primary)", "#FFFBF5"),
+    "medication": ("fa-pills", "var(--pf-pink)", "#FFFBF5"),
+    "bath": ("fa-droplet", "var(--pf-blue)", "#FFFBF5"),
+    "food_refill": ("fa-bowl-food", "var(--pf-accent)", "#4A3225"),
+    "own_birthday": ("fa-cake-candles", "var(--pf-lavender)", "#FFFBF5"),
+    "friend_birthday": ("fa-cake-candles", "var(--pf-lavender)", "#FFFBF5"),
+    "registration": ("fa-file-lines", "var(--pf-secondary)", "#FFFBF5"),
+    "boarding_checkin": ("fa-suitcase-rolling", "var(--pf-primary-hover)", "#FFFBF5"),
+    "new_profile": ("fa-paw", "var(--pf-pink)", "#FFFBF5"),
+}
+_DEFAULT_ICON = ("fa-paw", "var(--pf-text-muted)", "#FFFBF5")
+
+
+def days_until_from_iso(iso_date: str):
+    """days-from-today for a plain ISO date string, or None if unset/unparseable --
+    shared so profile_detail.py's due-date rows compute urgency exactly the same way
+    db.get_upcoming_events already does for the dashboard, rather than a second
+    slightly-different implementation."""
+    if not iso_date:
+        return None
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (d - date.today()).days
+
+
+def icon_circle_html(item_type: str, size: int = 40) -> str:
+    icon_class, bg, icon_color = _TYPE_ICON.get(item_type, _DEFAULT_ICON)
+    font_size = round(size * 0.42)
+    return (
+        f"<div style='width:{size}px;height:{size}px;border-radius:50%;background:{bg};"
+        f"display:flex;align-items:center;justify-content:center;flex-shrink:0;'>"
+        f"<i class='fa-solid {icon_class}' style='color:{icon_color};font-size:{font_size}px;'></i></div>"
+    )
+
+
+def urgency_tier(days_until: int) -> str:
+    """4 buckets, most-to-least urgent. Shared by the badge below and by the dashboard
+    card's container key (see home.py), so a card's left accent bar and its top-right
+    badge always agree with each other about how urgent it is -- they used to be two
+    separate 3-bucket computations (one via st.error/warning/success, one via the CSS
+    key) that happened to line up only because both hardcoded the same <=3-day cutoff."""
+    if days_until < 0:
+        return "overdue"
+    if days_until <= 3:
+        return "soon"
+    if days_until <= 7:
+        return "week"
+    return "routine"
+
+
+def urgency_badge_html(days_until: int) -> str:
+    """Color intensity steps down as urgency drops: overdue/due-soon are the most
+    saturated (danger red / brand orange), "this week" is medium (gold), and routine
+    items are deliberately calm and muted -- low-contrast on purpose, so a screen full
+    of upcoming items doesn't read as uniformly alarming."""
+    tier = urgency_tier(days_until)
+    if tier == "overdue":
+        label, bg, color, border = f"{abs(days_until)}d overdue", "var(--pf-danger)", "#FFFBF5", "transparent"
+    elif tier == "soon":
+        if days_until == 0:
+            label = "Due today"
+        elif days_until == 1:
+            label = "Due tomorrow"
+        else:
+            label = f"Due in {days_until}d"
+        bg, color, border = "var(--pf-primary)", "#FFFBF5", "transparent"
+    elif tier == "week":
+        # Fixed dark text, not var(--pf-text) -- --pf-accent (gold) stays light-toned in
+        # both light *and* dark mode (see styles.py), so the theme-flipping text color
+        # would go light-on-light in dark mode instead of tracking the background.
+        label, bg, color, border = "This week", "var(--pf-accent)", "#4A3225", "transparent"
+    else:
+        label, bg, color, border = "Routine", "var(--pf-card-bg-alt)", "var(--pf-text-muted)", "var(--pf-border)"
+    return (
+        f"<span style='background:{bg};color:{color};padding:4px 12px;border-radius:999px;"
+        f"font-size:0.78em;font-weight:700;white-space:nowrap;border:1.5px solid {border};'>{label}</span>"
+    )
+
+
+def render_card_header(item_type: str, days_until: int = None):
+    """Icon circle top-left + (if days_until is given) urgency badge top-right, as one
+    row. days_until=None renders just the icon circle alone (e.g. 'New Pack Members'
+    cards, which have no due date/urgency concept at all)."""
+    badge = urgency_badge_html(days_until) if days_until is not None else ""
+    st.markdown(
+        "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;'>"
+        + icon_circle_html(item_type) + badge + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 _ADD_NEW_VET_OPTION = "➕ Add a new vet..."
 
 
@@ -215,7 +316,7 @@ def _confirm_delete_modal(item_label, on_confirm, success_msg):
 
 
 @st.dialog("Link a vet")
-def _link_vet_dialog(profile_id: int, key_prefix: str, available_vets, choice_labels):
+def _link_vet_dialog(profile_id: int, owner_id: str, key_prefix: str, available_vets, choice_labels):
     # Lives outside the form, same reactive pattern as the Add Friend / Identity dialogs --
     # picking an existing vet swaps the "new vet" fields for a read-only look at that vet's
     # actual stored details instead of leaving unrelated, inert text boxes sitting there
@@ -255,21 +356,21 @@ def _link_vet_dialog(profile_id: int, key_prefix: str, available_vets, choice_la
             st.warning("Vet name is required to add a new vet.")
         else:
             if choice_index == 0:
-                vet_id = create_vet(new_name, new_clinic, new_phone, new_address, new_notes)
+                vet_id = create_vet(new_name, new_clinic, new_phone, new_address, new_notes, owner_id)
             else:
                 vet_id = available_vets[choice_index - 1]["id"]
-            link_vet_to_profile(profile_id, vet_id, is_primary)
+            link_vet_to_profile(profile_id, vet_id, owner_id, is_primary)
             queue_toast("Vet linked.")
             st.rerun()
     if cancelled:
         st.rerun()
 
 
-def render_vet_picker(profile_id: int, key_prefix: str = "vet"):
+def render_vet_picker(profile_id: int, owner_id: str, key_prefix: str = "vet"):
     """Reusable 'select a vet or add one inline' widget. Shows vets already linked to
     this profile (with unlink / set-primary controls), then a button that opens a dialog
-    to link an existing vet from the shared directory or create a brand new one."""
-    linked = get_vets_for_profile(profile_id)
+    to link an existing vet from this user's own vet directory or create a brand new one."""
+    linked = get_vets_for_profile(profile_id, owner_id)
     if linked:
         for v in linked:
             label = f"{'⭐ ' if v['is_primary'] else ''}{v['vet_name']}"
@@ -285,14 +386,14 @@ def render_vet_picker(profile_id: int, key_prefix: str = "vet"):
                 cols = st.columns(2)
                 if not v["is_primary"]:
                     if cols[0].button("Set as primary", key=f"{key_prefix}_primary_{v['link_id']}", use_container_width=True):
-                        set_primary_vet(profile_id, v["link_id"])
+                        set_primary_vet(profile_id, v["link_id"], owner_id)
                         queue_toast(f"{v['vet_name']} set as primary vet.", icon="⭐")
                         st.rerun()
                 # Unlinking is low-stakes and fully reversible (the vet stays in the
                 # shared directory, ready to relink), so it intentionally skips the
                 # confirm-delete dialog and the red danger styling used for real deletes.
                 if cols[1].button("Unlink", key=f"unlink_{key_prefix}_{v['link_id']}", use_container_width=True):
-                    unlink_vet_from_profile(v["link_id"])
+                    unlink_vet_from_profile(v["link_id"], owner_id)
                     queue_toast(f"{v['vet_name']} unlinked.", icon="↩️")
                     st.rerun()
     else:
@@ -302,10 +403,10 @@ def render_vet_picker(profile_id: int, key_prefix: str = "vet"):
     # Only offer vets not already linked to this profile — avoids redundant re-linking
     # and, since two vets can legitimately share a display label (same name, same/no
     # clinic), selection below is by list position, not by that label string.
-    available_vets = [v for v in get_all_vets() if v["id"] not in linked_vet_ids]
+    available_vets = [v for v in get_all_vets(owner_id) if v["id"] not in linked_vet_ids]
     choice_labels = [_ADD_NEW_VET_OPTION] + [
         f"{v['vet_name']} — {v['clinic_name'] or 'no clinic listed'}" for v in available_vets
     ]
 
     if st.button("➕ Link a vet", key=f"btn_link_{key_prefix}", use_container_width=True):
-        _link_vet_dialog(profile_id, key_prefix, available_vets, choice_labels)
+        _link_vet_dialog(profile_id, owner_id, key_prefix, available_vets, choice_labels)

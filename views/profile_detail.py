@@ -16,12 +16,19 @@ from db import (
 from ui_helpers import (
     show_photo, save_uploaded_photo, show_tag_pills, render_vet_picker,
     request_delete, render_pending_delete_dialog, queue_toast, render_queued_toast,
+    render_card_header, days_until_from_iso,
 )
+
+# Module-level rather than threaded through every dialog function's parameters below --
+# this script re-runs top to bottom on every rerun (Streamlit's normal model), so it's
+# always fresh, and every nested function defined further down closes over it directly
+# the same way they already close over `profile`/`profile_id` in loop variables.
+owner_id = st.session_state["auth_user"]["user_id"]
 
 profile_id = st.session_state.get("selected_profile_id")
 
 if not profile_id:
-    all_profiles = get_all_profiles()
+    all_profiles = get_all_profiles(owner_id)
     if not all_profiles:
         st.info("No profiles yet. Add one from **New Profile** at the top first.")
         st.stop()
@@ -30,21 +37,28 @@ if not profile_id:
     profile_id = names[choice]
     st.session_state["selected_profile_id"] = profile_id
 
-profile = get_profile(profile_id)
+profile = get_profile(profile_id, owner_id)
 if not profile:
     st.error("This profile no longer exists.")
     st.session_state["selected_profile_id"] = None
     st.stop()
 
 
-def _record_row(summary: str, key: str, on_click):
+def _record_row(summary: str, key: str, on_click, icon_type: str = None, due_iso: str = None):
     """A single existing record as a compact read-only line + an Edit button that
     opens a dialog. Used for every record list on this page instead of an expander,
     since a dialog always closes cleanly on Save/Delete/Cancel — an expander's
     open/closed state is "sticky" in the browser and can't be forced shut from Python
     once a user has touched it, which is what made an old expander-per-record layout
-    feel like it never collapsed after an action."""
+    feel like it never collapsed after an action.
+
+    icon_type/due_iso are optional -- only record types with an actual due date
+    (vaccinations, non-ongoing medications, baths, food refills, boarding check-ins)
+    pass them, to show the same icon-circle + urgency badge header the dashboard uses;
+    records with no due-date concept (surgeries, vet visits, friends) render plain."""
     with st.container(border=True):
+        if icon_type is not None:
+            render_card_header(icon_type, days_until_from_iso(due_iso) if due_iso else None)
         cols = st.columns([5, 1.3])
         cols[0].markdown(summary)
         if cols[1].button("Edit", key=key, use_container_width=True):
@@ -96,7 +110,7 @@ def _edit_identity_dialog(profile_id, profile):
             "hangout_location": hangout_location or None,
             "other_notes": other_notes or None,
         })
-        update_profile(profile_id, data)
+        update_profile(profile_id, data, owner_id)
         queue_toast("Identity updated.", icon="✅")
         st.rerun()
     if cancelled:
@@ -110,7 +124,7 @@ def _delete_profile_dialog(profile_id, profile_name):
         "vaccination, medication, surgery, vet visit, friend, bath, food refill, and "
         "boarding record on file for them. This can't be undone."
     )
-    friend_refs, sibling_refs = count_incoming_links(profile_id)
+    friend_refs, sibling_refs = count_incoming_links(profile_id, owner_id)
     if friend_refs or sibling_refs:
         mentions = []
         if friend_refs:
@@ -120,7 +134,7 @@ def _delete_profile_dialog(profile_id, profile_name):
         st.warning(f"Also removes {profile_name} from " + " and ".join(mentions) + " — those profiles aren't deleted, just the connection to this one.")
     c1, c2 = st.columns(2)
     if c1.button("Yes, delete permanently", key="delete_confirm_yes", use_container_width=True):
-        delete_profile(profile_id)
+        delete_profile(profile_id, owner_id)
         st.session_state["selected_profile_id"] = None
         queue_toast(f"{profile_name}'s profile was deleted.", icon="🗑️")
         st.switch_page("views/all_profiles.py")
@@ -143,7 +157,7 @@ def _add_vaccination_dialog(profile_id):
         cancelled = c2.form_submit_button("Cancel", key="cancel_add_vacc", use_container_width=True)
     if submitted:
         if vname:
-            add_vaccination(profile_id, vname, given.isoformat(), due.isoformat() if due else None)
+            add_vaccination(profile_id, vname, given.isoformat(), due.isoformat() if due else None, owner_id)
             queue_toast("Vaccination added.", icon="✅")
             st.rerun()
         else:
@@ -163,11 +177,11 @@ def _edit_vaccination_dialog(v):
         remove = c2.form_submit_button("Delete", key=f"delete_vacc_{v['id']}", use_container_width=True)
         cancel = c3.form_submit_button("Cancel", key=f"cancel_edit_vacc_{v['id']}", use_container_width=True)
     if save:
-        update_vaccination(v["id"], vname, given.isoformat() if given else None, due.isoformat() if due else None)
+        update_vaccination(v["id"], vname, given.isoformat() if given else None, due.isoformat() if due else None, owner_id)
         queue_toast("Vaccination updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"the vaccination **{v['vaccine_name']}**", lambda vid=v["id"]: delete_vaccination(vid), "Vaccination deleted.")
+        request_delete(f"the vaccination **{v['vaccine_name']}**", lambda vid=v["id"]: delete_vaccination(vid, owner_id), "Vaccination deleted.")
     if cancel:
         st.rerun()
 
@@ -194,7 +208,7 @@ def _edit_registration_dialog(profile_id, profile):
             "reg_last_renewed": reg_last_renewed.isoformat() if reg_last_renewed else None,
             "reg_next_due": reg_next_due.isoformat() if reg_next_due else None,
         })
-        update_profile(profile_id, data)
+        update_profile(profile_id, data, owner_id)
         queue_toast("Registration updated.", icon="✅")
         st.rerun()
     if cancelled:
@@ -221,7 +235,7 @@ def _add_medication_dialog(profile_id):
         if mname:
             add_medication(
                 profile_id, mname, dosage, frequency, start.isoformat(),
-                None if ongoing else (end.isoformat() if end else None), ongoing
+                None if ongoing else (end.isoformat() if end else None), ongoing, owner_id
             )
             queue_toast("Medication added.", icon="✅")
             st.rerun()
@@ -249,12 +263,12 @@ def _edit_medication_dialog(m):
             m["id"], mname, dosage, frequency,
             start.isoformat() if start else None,
             None if ongoing else (end.isoformat() if end else None),
-            ongoing,
+            ongoing, owner_id,
         )
         queue_toast("Medication updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"the medication **{m['med_name']}**", lambda mid=m["id"]: delete_medication(mid), "Medication deleted.")
+        request_delete(f"the medication **{m['med_name']}**", lambda mid=m["id"]: delete_medication(mid, owner_id), "Medication deleted.")
     if cancel:
         st.rerun()
 
@@ -284,7 +298,7 @@ def _edit_spay_neuter_dialog(profile_id, profile):
             "spay_neuter_status": spay_status,
             "spay_neuter_date": spay_date.isoformat() if spay_date else None,
         })
-        update_profile(profile_id, data)
+        update_profile(profile_id, data, owner_id)
         queue_toast("Spay/neuter status updated.", icon="✅")
         st.rerun()
     if cancelled:
@@ -306,7 +320,7 @@ def _add_surgery_dialog(profile_id):
         cancelled = c2.form_submit_button("Cancel", key="cancel_add_surgery", use_container_width=True)
     if submitted:
         if sname:
-            add_surgery(profile_id, sname, sdate.isoformat(), snotes)
+            add_surgery(profile_id, sname, sdate.isoformat(), snotes, owner_id)
             queue_toast("Surgery added.", icon="✅")
             st.rerun()
         else:
@@ -326,11 +340,11 @@ def _edit_surgery_dialog(s):
         remove = c2.form_submit_button("Delete", key=f"delete_surgery_{s['id']}", use_container_width=True)
         cancel = c3.form_submit_button("Cancel", key=f"cancel_edit_surgery_{s['id']}", use_container_width=True)
     if save:
-        update_surgery(s["id"], sname, sdate.isoformat() if sdate else None, snotes)
+        update_surgery(s["id"], sname, sdate.isoformat() if sdate else None, snotes, owner_id)
         queue_toast("Surgery updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"the surgery record **{s['surgery_name']}**", lambda sid=s["id"]: delete_surgery(sid), "Surgery record deleted.")
+        request_delete(f"the surgery record **{s['surgery_name']}**", lambda sid=s["id"]: delete_surgery(sid, owner_id), "Surgery record deleted.")
     if cancel:
         st.rerun()
 
@@ -349,7 +363,7 @@ def _add_vet_visit_dialog(profile_id):
         submitted = c1.form_submit_button("Add vet visit", use_container_width=True)
         cancelled = c2.form_submit_button("Cancel", key="cancel_add_visit", use_container_width=True)
     if submitted:
-        add_vet_visit(profile_id, vdate.isoformat(), vreason, vnotes)
+        add_vet_visit(profile_id, vdate.isoformat(), vreason, vnotes, owner_id)
         queue_toast("Vet visit added.", icon="✅")
         st.rerun()
     if cancelled:
@@ -367,11 +381,11 @@ def _edit_vet_visit_dialog(vv):
         remove = c2.form_submit_button("Delete", key=f"delete_visit_{vv['id']}", use_container_width=True)
         cancel = c3.form_submit_button("Cancel", key=f"cancel_edit_visit_{vv['id']}", use_container_width=True)
     if save:
-        update_vet_visit(vv["id"], vdate.isoformat() if vdate else None, vreason, vnotes)
+        update_vet_visit(vv["id"], vdate.isoformat() if vdate else None, vreason, vnotes, owner_id)
         queue_toast("Vet visit updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"this vet visit record ({vv['visit_date'] or 'date unknown'})", lambda vvid=vv["id"]: delete_vet_visit(vvid), "Vet visit deleted.")
+        request_delete(f"this vet visit record ({vv['visit_date'] or 'date unknown'})", lambda vvid=vv["id"]: delete_vet_visit(vvid, owner_id), "Vet visit deleted.")
     if cancel:
         st.rerun()
 
@@ -399,7 +413,7 @@ def _edit_personality_dialog(profile_id, profile):
             "favorite_foods": favorite_foods, "foods_to_avoid": foods_to_avoid,
             "favorite_games": favorite_games,
         })
-        update_profile(profile_id, data)
+        update_profile(profile_id, data, owner_id)
         queue_toast("Personality updated.", icon="✅")
         st.rerun()
     if cancelled:
@@ -418,8 +432,8 @@ def _add_friend_dialog(profile_id):
     # Which-kind-of-friend lives outside the form so picking an existing pup can swap
     # the name/birthday fields for a simple confirmation line, the same reactive
     # pattern used for Profile type on the Identity dialog.
-    already_linked = {f["friend_profile_id"] for f in get_friends(profile_id) if f["friend_profile_id"]}
-    candidates = [p for p in get_all_profiles() if p["id"] != profile_id and p["id"] not in already_linked]
+    already_linked = {f["friend_profile_id"] for f in get_friends(profile_id, owner_id) if f["friend_profile_id"]}
+    candidates = [p for p in get_all_profiles(owner_id) if p["id"] != profile_id and p["id"] not in already_linked]
     choice_labels = [_ADD_NEW_FRIEND_OPTION] + [p["name"] for p in candidates]
     choice_index = st.selectbox(
         "Who's this friend?", options=range(len(choice_labels)), format_func=lambda i: choice_labels[i]
@@ -439,14 +453,14 @@ def _add_friend_dialog(profile_id):
     if submitted:
         if choice_index == 0:
             if fname:
-                add_friend(profile_id, fname, fbday.isoformat() if fbday else None, fnotes)
+                add_friend(profile_id, fname, fbday.isoformat() if fbday else None, fnotes, owner_id)
                 queue_toast("Friend added.", icon="✅")
                 st.rerun()
             else:
                 st.warning("Friend's name is required.")
         else:
             chosen = candidates[choice_index - 1]
-            add_friend(profile_id, chosen["name"], None, fnotes, friend_profile_id=chosen["id"])
+            add_friend(profile_id, chosen["name"], None, fnotes, owner_id, friend_profile_id=chosen["id"])
             queue_toast(f"{chosen['name']} added as a friend.", icon="✅")
             st.rerun()
     if cancelled:
@@ -470,11 +484,11 @@ def _edit_friend_dialog(f, profile_name):
             remove = c2.form_submit_button("Remove", key=f"delete_friend_{f['id']}", use_container_width=True)
             cancel = c3.form_submit_button("Cancel", key=f"cancel_edit_friend_{f['id']}", use_container_width=True)
         if save:
-            update_friend(f["id"], f["friend_name"], f["friend_birthday"], fnotes)
+            update_friend(f["id"], f["friend_name"], f["friend_birthday"], fnotes, owner_id)
             queue_toast("Friend updated.", icon="✅")
             st.rerun()
         if remove:
-            request_delete(f"**{display_name}** from {profile_name}'s friends", lambda fid=f["id"]: delete_friend(fid), "Friend removed.")
+            request_delete(f"**{display_name}** from {profile_name}'s friends", lambda fid=f["id"]: delete_friend(fid, owner_id), "Friend removed.")
         if cancel:
             st.rerun()
     else:
@@ -488,11 +502,11 @@ def _edit_friend_dialog(f, profile_name):
             remove = c2.form_submit_button("Delete", key=f"delete_friend_{f['id']}", use_container_width=True)
             cancel = c3.form_submit_button("Cancel", key=f"cancel_edit_friend_{f['id']}", use_container_width=True)
         if save:
-            update_friend(f["id"], fname, fbday.isoformat() if fbday else None, fnotes)
+            update_friend(f["id"], fname, fbday.isoformat() if fbday else None, fnotes, owner_id)
             queue_toast("Friend updated.", icon="✅")
             st.rerun()
         if remove:
-            request_delete(f"**{f['friend_name']}** from {profile_name}'s friends", lambda fid=f["id"]: delete_friend(fid), "Friend deleted.")
+            request_delete(f"**{f['friend_name']}** from {profile_name}'s friends", lambda fid=f["id"]: delete_friend(fid, owner_id), "Friend deleted.")
         if cancel:
             st.rerun()
 
@@ -503,8 +517,8 @@ def _edit_friend_dialog(f, profile_name):
 
 @st.dialog("Add sibling")
 def _add_sibling_dialog(profile_id):
-    existing_ids = {s["sibling_id"] for s in get_siblings(profile_id)}
-    other_profiles = [p for p in get_all_profiles() if p["id"] != profile_id]
+    existing_ids = {s["sibling_id"] for s in get_siblings(profile_id, owner_id)}
+    other_profiles = [p for p in get_all_profiles(owner_id) if p["id"] != profile_id]
     candidates = [p for p in other_profiles if p["id"] not in existing_ids]
     if not candidates:
         if other_profiles:
@@ -522,7 +536,7 @@ def _add_sibling_dialog(profile_id):
     cancelled = c2.button("Cancel", key="cancel_add_sibling", use_container_width=True)
     if submitted:
         chosen = candidates[choice_index]
-        add_sibling(profile_id, chosen["id"])
+        add_sibling(profile_id, chosen["id"], owner_id)
         queue_toast(f"{chosen['name']} added as a sibling.", icon="✅")
         st.rerun()
     if cancelled:
@@ -542,7 +556,7 @@ def _add_bath_dialog(profile_id):
         submitted = c1.form_submit_button("Add bath record", use_container_width=True)
         cancelled = c2.form_submit_button("Cancel", key="cancel_add_bath", use_container_width=True)
     if submitted:
-        add_bath(profile_id, bdate.isoformat(), bdue.isoformat() if bdue else None)
+        add_bath(profile_id, bdate.isoformat(), bdue.isoformat() if bdue else None, owner_id)
         queue_toast("Bath record added.", icon="✅")
         st.rerun()
     if cancelled:
@@ -559,11 +573,11 @@ def _edit_bath_dialog(b):
         remove = c2.form_submit_button("Delete", key=f"delete_bath_{b['id']}", use_container_width=True)
         cancel = c3.form_submit_button("Cancel", key=f"cancel_edit_bath_{b['id']}", use_container_width=True)
     if save:
-        update_bath(b["id"], bdate.isoformat() if bdate else None, bdue.isoformat() if bdue else None)
+        update_bath(b["id"], bdate.isoformat() if bdate else None, bdue.isoformat() if bdue else None, owner_id)
         queue_toast("Bath record updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"this bath record ({b['bath_date'] or 'unknown date'})", lambda bid=b["id"]: delete_bath(bid), "Bath record deleted.")
+        request_delete(f"this bath record ({b['bath_date'] or 'unknown date'})", lambda bid=b["id"]: delete_bath(bid, owner_id), "Bath record deleted.")
     if cancel:
         st.rerun()
 
@@ -582,7 +596,7 @@ def _add_food_refill_dialog(profile_id):
         submitted = c1.form_submit_button("Add food refill record", use_container_width=True)
         cancelled = c2.form_submit_button("Cancel", key="cancel_add_refill", use_container_width=True)
     if submitted:
-        add_food_refill(profile_id, ftype, flast.isoformat(), fnext.isoformat() if fnext else None)
+        add_food_refill(profile_id, ftype, flast.isoformat(), fnext.isoformat() if fnext else None, owner_id)
         queue_toast("Food refill record added.", icon="✅")
         st.rerun()
     if cancelled:
@@ -604,11 +618,12 @@ def _edit_food_refill_dialog(fr):
             fr["id"], ftype,
             flast.isoformat() if flast else None,
             fnext.isoformat() if fnext else None,
+            owner_id,
         )
         queue_toast("Food refill record updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"this food refill record ({fr['food_type'] or 'food'})", lambda frid=fr["id"]: delete_food_refill(frid), "Food refill record deleted.")
+        request_delete(f"this food refill record ({fr['food_type'] or 'food'})", lambda frid=fr["id"]: delete_food_refill(frid, owner_id), "Food refill record deleted.")
     if cancel:
         st.rerun()
 
@@ -631,7 +646,7 @@ def _add_boarding_stay_dialog(profile_id):
         if facility:
             add_boarding_stay(
                 profile_id, facility, check_in.isoformat(),
-                check_out.isoformat() if check_out else None, bnotes
+                check_out.isoformat() if check_out else None, bnotes, owner_id
             )
             queue_toast("Boarding stay added.", icon="✅")
             st.rerun()
@@ -657,12 +672,12 @@ def _edit_boarding_stay_dialog(bs):
             bs["id"], facility,
             check_in.isoformat() if check_in else None,
             check_out.isoformat() if check_out else None,
-            bnotes,
+            bnotes, owner_id,
         )
         queue_toast("Boarding stay updated.", icon="✅")
         st.rerun()
     if remove:
-        request_delete(f"this boarding stay at **{bs['facility_name'] or 'boarding'}**", lambda bsid=bs["id"]: delete_boarding_stay(bsid), "Boarding stay deleted.")
+        request_delete(f"this boarding stay at **{bs['facility_name'] or 'boarding'}**", lambda bsid=bs["id"]: delete_boarding_stay(bsid, owner_id), "Boarding stay deleted.")
     if cancel:
         st.rerun()
 
@@ -721,11 +736,11 @@ tab_health, tab_personality, tab_social, tab_care = st.tabs(
 
 # ================= HEALTH =================
 with tab_health:
-    vet_count = len(get_vets_for_profile(profile_id))
+    vet_count = len(get_vets_for_profile(profile_id, owner_id))
     with st.expander(f"🐾 Vets · {vet_count}", key="exp_health_vets"):
-        render_vet_picker(profile_id, key_prefix=f"vetpicker_{profile_id}")
+        render_vet_picker(profile_id, owner_id, key_prefix=f"vetpicker_{profile_id}")
 
-    vaccinations = get_vaccinations(profile_id)
+    vaccinations = get_vaccinations(profile_id, owner_id)
     with st.expander(f"💉 Vaccinations · {len(vaccinations)}", key="exp_health_vacc"):
         if not vaccinations:
             st.caption("No vaccination records yet.")
@@ -734,6 +749,7 @@ with tab_health:
                 f"💉 **{v['vaccine_name']}** — next due {v['next_due_date'] or 'unset'}",
                 f"editbtn_vacc_{v['id']}",
                 lambda v=v: _edit_vaccination_dialog(v),
+                icon_type="vaccination", due_iso=v["next_due_date"],
             )
         if st.button("➕ Add vaccination", key="btn_add_vacc", use_container_width=True):
             _add_vaccination_dialog(profile_id)
@@ -743,6 +759,8 @@ with tab_health:
             "Only relevant if this dog is registered with the Chennai Corporation's "
             "pet program — safe to leave blank otherwise."
         )
+        if profile["reg_next_due"]:
+            render_card_header("registration", days_until_from_iso(profile["reg_next_due"]))
         st.write(
             f"Registration ID: **{profile['reg_id'] or '—'}** · "
             f"Last renewed: {profile['reg_last_renewed'] or '—'} · "
@@ -751,7 +769,7 @@ with tab_health:
         if st.button("✏️ Edit Registration", key="btn_edit_reg", use_container_width=True):
             _edit_registration_dialog(profile_id, profile)
 
-    medications = get_medications(profile_id)
+    medications = get_medications(profile_id, owner_id)
     with st.expander(f"💊 Medications · {len(medications)}", key="exp_health_med"):
         if not medications:
             st.caption("No medications on record.")
@@ -761,6 +779,9 @@ with tab_health:
                 f"💊 **{m['med_name']}** — {status}",
                 f"editbtn_med_{m['id']}",
                 lambda m=m: _edit_medication_dialog(m),
+                # Ongoing meds have no end date and thus no urgency concept -- same
+                # "ongoing excluded" rule the dashboard's get_upcoming_events applies.
+                icon_type="medication", due_iso=(m["end_date"] if not m["ongoing"] else None),
             )
         if st.button("➕ Add medication", key="btn_add_med", use_container_width=True):
             _add_medication_dialog(profile_id)
@@ -772,7 +793,7 @@ with tab_health:
         if st.button("✏️ Edit Spay/Neuter Status", key="btn_edit_spay", use_container_width=True):
             _edit_spay_neuter_dialog(profile_id, profile)
 
-    surgeries = get_surgeries(profile_id)
+    surgeries = get_surgeries(profile_id, owner_id)
     with st.expander(f"🩹 Surgeries · {len(surgeries)}", key="exp_health_surgery"):
         if not surgeries:
             st.caption("No surgeries on record.")
@@ -785,7 +806,7 @@ with tab_health:
         if st.button("➕ Add surgery", key="btn_add_surgery", use_container_width=True):
             _add_surgery_dialog(profile_id)
 
-    visits = get_vet_visits(profile_id)
+    visits = get_vet_visits(profile_id, owner_id)
     with st.expander(f"🩺 Vet Visit History · {len(visits)}", key="exp_health_visits"):
         if not visits:
             st.caption("No vet visits on record.")
@@ -819,7 +840,7 @@ with tab_personality:
 # ================= SOCIAL =================
 with tab_social:
     st.subheader("Friends")
-    friends = get_friends(profile_id)
+    friends = get_friends(profile_id, owner_id)
     if not friends:
         st.caption("No friends on record yet.")
     for f in friends:
@@ -837,7 +858,7 @@ with tab_social:
 
     st.divider()
     st.subheader("Siblings")
-    siblings = get_siblings(profile_id)
+    siblings = get_siblings(profile_id, owner_id)
     if not siblings:
         st.caption("No siblings linked yet.")
     for s in siblings:
@@ -848,7 +869,7 @@ with tab_social:
             # is touched, just the association) — same reasoning as "Unlink vet": no
             # confirm dialog, no danger styling.
             if cols[1].button("Remove", key=f"remove_sibling_{s['link_id']}", use_container_width=True):
-                remove_sibling(s["link_id"])
+                remove_sibling(s["link_id"], owner_id)
                 queue_toast(f"{s['sibling_name']} removed as a sibling.", icon="↩️")
                 st.rerun()
     if st.button("➕ Add sibling", key="btn_add_sibling", use_container_width=True):
@@ -856,7 +877,7 @@ with tab_social:
 
 # ================= CARE & LOGISTICS =================
 with tab_care:
-    baths = get_baths(profile_id)
+    baths = get_baths(profile_id, owner_id)
     with st.expander(f"🛁 Bath Tracking · {len(baths)}", key="exp_care_bath"):
         if not baths:
             st.caption("No bath records yet.")
@@ -865,11 +886,12 @@ with tab_care:
                 f"🛁 Last bath {b['bath_date'] or 'unknown'} — next due {b['next_due_date'] or 'unset'}",
                 f"editbtn_bath_{b['id']}",
                 lambda b=b: _edit_bath_dialog(b),
+                icon_type="bath", due_iso=b["next_due_date"],
             )
         if st.button("➕ Add bath record", key="btn_add_bath", use_container_width=True):
             _add_bath_dialog(profile_id)
 
-    refills = get_food_refills(profile_id)
+    refills = get_food_refills(profile_id, owner_id)
     with st.expander(f"🥣 Food Refill Tracking · {len(refills)}", key="exp_care_refill"):
         if not refills:
             st.caption("No food refill records yet.")
@@ -878,19 +900,26 @@ with tab_care:
                 f"🥣 {fr['food_type'] or 'food'} — next refill {fr['next_refill_date'] or 'unset'}",
                 f"editbtn_refill_{fr['id']}",
                 lambda fr=fr: _edit_food_refill_dialog(fr),
+                icon_type="food_refill", due_iso=fr["next_refill_date"],
             )
         if st.button("➕ Add food refill record", key="btn_add_refill", use_container_width=True):
             _add_food_refill_dialog(profile_id)
 
-    stays = get_boarding_stays(profile_id)
+    stays = get_boarding_stays(profile_id, owner_id)
     with st.expander(f"🧳 Boarding History · {len(stays)}", key="exp_care_stay"):
         if not stays:
             st.caption("No boarding history yet.")
         for bs in stays:
+            # Only a *future* check-in reads as "upcoming" -- a past stay's check-in date
+            # isn't "overdue," it's just history, matching get_upcoming_events' own
+            # days_until >= 0 filter for this event type.
+            check_in_days = days_until_from_iso(bs["check_in_date"])
+            upcoming_check_in = bs["check_in_date"] if check_in_days is not None and check_in_days >= 0 else None
             _record_row(
                 f"🧳 {bs['facility_name'] or 'boarding'} — {bs['check_in_date'] or '?'} to {bs['check_out_date'] or '?'}",
                 f"editbtn_stay_{bs['id']}",
                 lambda bs=bs: _edit_boarding_stay_dialog(bs),
+                icon_type="boarding_checkin", due_iso=upcoming_check_in,
             )
         if st.button("➕ Add boarding stay", key="btn_add_stay", use_container_width=True):
             _add_boarding_stay_dialog(profile_id)
