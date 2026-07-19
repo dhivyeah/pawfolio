@@ -1015,3 +1015,911 @@ noting it since it's new *noise* even if not a new *failure*).
   worth an eye on the icon-circle + badge header row specifically at narrow widths — it's a
   `display:flex; justify-content:space-between` row that hasn't been checked against a very
   long urgency label (e.g. "14d overdue") on the smallest supported phone width.
+
+## Adversarial / Exploratory Pass — 2026-07-19
+
+Went beyond the structured Phase 1–4 checklist: explored the app the way a careless real user
+or someone probing for weaknesses might, using direct `db.py` reproduction (isolated/self-
+cleaning against production, same discipline as every other pass), `AppTest` session-state
+simulation, and code review. Two findings below need **your decision before anything else** —
+both are genuine cross-user data exposures, reachable through completely normal use (no
+malicious intent required), found while specifically re-checking the cross-user visibility
+guarantee from Part 1. Everything else is lower-stakes. Full test suite re-run clean after the
+one fix applied during this pass (XSS escaping) — 72 passed, same 6 pre-existing failures.
+
+### 🔴 Logging out doesn't clear the toast-notification queue — the next person to log in on the same browser can see a fragment of the previous user's data
+
+- **Severity:** High — **FIXED 2026-07-19**
+- **Steps to reproduce:** Log in as User A. On the Profile Detail page, do anything that shows
+  a confirmation toast that names something specific — e.g. "Set as primary vet" (toast:
+  "**{vet name}** set as primary vet"), unlinking a vet, removing a sibling, adding/editing a
+  friend. Log out **without visiting Home or All the Pups afterward** (Profile Detail never
+  triggers the toast to actually display — see Location below). Log in as a different user (or
+  have someone else use the same browser) — they land on Home by default.
+- **Expected vs. actual:** Expected a queued notification to either fire before logout or be
+  discarded on logout. Actual, reproduced directly: the queued toast survives in
+  `st.session_state` across the logout, and fires for **whoever loads Home next** — confirmed
+  with a simulated handoff where User B's very first page load showed a toast containing User
+  A's private vet name, with no action from B beyond just logging in and landing on the
+  default page. This isn't a narrow timing race — since actions taken *on* Profile Detail don't
+  consume their own toast (only Home/All the Pups do), the queued message routinely survives
+  until the next visit to Home regardless of how much time passes, making "log out right after
+  editing something, then someone else logs in" a very ordinary sequence to hit by accident on
+  a shared or reused browser/device.
+- **Location:** `app.py`'s log-out handler only clears `auth_user` and `_notify_checked` from
+  `st.session_state` — never `_toast_queue`. `ui_helpers.py`'s `queue_toast()`/
+  `render_queued_toast()`.
+- **Why this needs your call:** The actual data exposed is narrow (one toast message, not a
+  full profile), and today it only matters on a genuinely shared/reused browser session (a
+  household computer, a borrowed device, or the app's own multi-tab quirks) — not remotely
+  exploitable. But it's a real violation of "one user should never see any fragment of
+  another's data," which was the explicit point of Phase 4, so it seemed worth flagging as
+  High and asking rather than just quietly fixing or downgrading it myself. The fix itself is
+  small (clear `_toast_queue` — and see the related finding below, `_pending_delete` — on
+  logout), but wanted your sign-off before touching session/logout behavior again given how
+  much back-and-forth debugging that area already took during setup.
+- **Fixed 2026-07-19:** `_toast_queue` added to the set of keys cleared in `app.py`'s log-out
+  handler, alongside `auth_user` and `_notify_checked`. Verified via a real logout-button click
+  in `AppTest` (not just reasoning about the code) — a queued toast containing private data
+  present before logout is confirmed gone from `st.session_state` immediately after. Full test
+  suite re-run clean (72 passed, same 6 pre-existing unrelated failures). The related
+  `_pending_delete` leak (Medium, below) was deliberately left open — flagged as a decision for
+  you, not fixed as part of this "critical/high, no-brainers only" pass.
+
+### 🔴 NEEDS YOUR DECISION: Logging out doesn't clear a pending delete-confirmation dialog — the next person to log in can see (but not act on) a fragment of the previous user's data
+
+- **Severity:** Medium
+- **Steps to reproduce:** Log in as User A. Click "Remove" on any record (a vaccination, a
+  friend, a surgery, etc.) to queue the confirm-delete dialog, then leave without clicking
+  "Yes, delete" or "Cancel" or the dialog's own X/Escape (e.g. close the browser tab entirely,
+  or the browser/app crashes). Log in as a different user and visit their own Profile Detail
+  page.
+- **Expected vs. actual:** Expected either the dialog to be gone, or (worst case) a generic
+  confirmation with no specifics. Actual, reproduced directly: User B's own profile page opens
+  with a modal already up front reading "Delete the vaccination **Rabies (Owner A private
+  info)**? This can't be undone." — User A's specific record name, verbatim, unprompted. If B
+  were to click "Yes, delete," the underlying `delete_*` call still carries **B's** `owner_id`
+  (looked up fresh from session state at click time, not A's — only the record id was
+  captured), so it silently no-ops against B's own account rather than actually deleting A's
+  record — confirmed no real cross-account deletion is possible here, only the informational
+  leak of the label itself.
+- **Location:** Same root cause as above — `app.py`'s log-out handler doesn't clear
+  `_pending_delete`. `ui_helpers.py`'s `request_delete()`/`render_pending_delete_dialog()`.
+  Narrower than the toast issue: Streamlit's own dialog-dismiss handling (`on_dismiss=`) already
+  clears this correctly for every *normal* way of leaving the dialog (X, Escape, click-outside,
+  Cancel) — only an abrupt tab close/crash leaves it dangling, so it's less likely to trigger
+  in practice than the toast issue.
+- **Why this needs your call:** Same reasoning as above — lower severity here since no actual
+  deletion can happen and it requires a more abrupt exit, but it's the same category of bug
+  and the same fix location, so flagging together rather than separately.
+
+### Fixed during this pass: stored HTML/JS injection via tag fields (self-XSS today, real risk once sharing ships)
+
+- **Severity:** Medium — **FIXED 2026-07-19**
+- **Steps to reproduce (before the fix):** Type `<img src=x onerror=alert(1)>` into "Likes" (or
+  Dislikes/Toys/Foods/Games), save, view the profile's Personality tab.
+- **Expected vs. actual:** Expected the text to render literally. Actual, confirmed directly:
+  `ui_helpers.show_tag_pills()` interpolated each tag into an HTML `<span>` and rendered it via
+  `unsafe_allow_html=True` with no escaping — a `<script>` or `<img onerror=...>` typed into any
+  tag field would execute as real HTML/JS, not display as text.
+- **Why Medium, not Critical, as found:** Every tag field is scoped to the profile's own owner
+  (confirmed — no query anywhere renders another owner's likes/dislikes to you), so this could
+  only ever attack the same account that typed the payload in — self-XSS, not a cross-user
+  attack, *today*. Flagging why it still matters: `profile_type` already has a `community_dog`
+  option explicitly earmarked for future shared/public visibility (per the original Phase 4
+  spec's "no shared/public visibility *yet*") — the moment that ships, this becomes a real
+  stored-XSS vector against other users, so it seemed worth fixing now rather than waiting.
+- **Fixed:** `show_tag_pills()` now runs each tag through `html.escape()` before interpolating
+  it into the `<span>`. Verified the malicious payload above now renders as inert escaped text
+  (`&lt;img src=x onerror=alert(1)&gt;`) instead of live HTML. No other `unsafe_allow_html=True`
+  call site in the codebase interpolates user-controlled text unescaped — checked every one
+  (`show_photo`'s image src is a base64 URI we generate, the mascot SVG is a fixed template,
+  the icon-circle/urgency-badge HTML only ever contains fixed labels and integers).
+- **Location:** `ui_helpers.py` — `show_tag_pills()`.
+
+### Confirmed working: exhaustive cross-owner mutation sweep
+
+- **Not a bug.** Extended Part 1's spot-checks to every remaining write/read function not yet
+  individually tested: `update_vaccination`, `delete_vaccination`, `update_medication`,
+  `delete_medication`, `update_surgery`, `delete_surgery`, `update_vet_visit`,
+  `delete_vet_visit`, `update_bath`, `delete_bath`, `update_food_refill`,
+  `delete_food_refill`, `update_boarding_stay`, `delete_boarding_stay`, `update_friend`,
+  `delete_friend`, `update_vet`, `delete_vet`, `get_vet`. Attempted every one as an owner who
+  doesn't own the target record — all either silently no-op (0 rows affected) or return
+  nothing, with zero exceptions and zero actual data changes, confirmed by re-reading every
+  record afterward.
+
+### Confirmed working: no SQL injection
+
+- **Not a bug.** Created a profile with the literal name `Rex'; DROP TABLE profiles; --` —
+  stored verbatim as inert text data (every query in `db.py` uses parameterized `%s`
+  placeholders, never string-formatted SQL), and the `profiles` table remained fully intact
+  and queryable afterward. As expected given the existing code, but worth confirming directly
+  rather than assuming.
+
+### Confirmed working: Postgres-level constraints hold even when the app layer doesn't check first
+
+- **Not a bug.** `create_profile()` has no application-level check on `profile_type`, but
+  Postgres's own `CHECK` constraint correctly rejected an invalid value (`not_a_real_type`)
+  outright — caught by `get_conn()`'s existing `except psycopg2.Error` handler and surfaced to
+  the (simulated) user as the same safe generic message used for every other database error,
+  never the raw constraint-violation text (which includes the full failing row, including the
+  owner's UUID) — confirmed that detail only ever reaches the server-side `print()` log, never
+  the UI.
+
+### Issue: An empty/blank profile name can be saved by bypassing the UI's own validation
+
+- **Severity:** Low
+- **Steps to reproduce:** Call `db.create_profile()` directly with `"name": ""` (the real Add
+  Profile form blocks this client-side, but nothing stops a differently-built caller).
+- **Expected vs. actual:** Expected a database-level safeguard (`NOT NULL` plus a non-empty
+  check, or similar) as a second line of defense. Actual: saved successfully with an empty
+  string — `profiles.name` is `NOT NULL` but Postgres doesn't consider `''` a violation of
+  that. Required-field validation exists only in the UI layer today, not the data layer.
+- **Location:** `db.py` — `create_profile()`, `update_profile()`. Same theme as existing
+  KNOWN_ISSUES item 13 ("editing an existing record doesn't re-validate required fields"), one
+  layer deeper.
+
+### Confirmed working: extreme and malformed dates don't crash anything
+
+- **Not a bug.** A due date of `9999-12-31` saves and displays correctly, and correctly stays
+  out of the 30-day upcoming-events list (way outside the horizon) rather than erroring. A
+  fully malformed date string (`"not-a-date"`) saves without validation (no format-checking at
+  the DB layer — `next_due_date` etc. are plain `TEXT`) but doesn't crash `get_upcoming_events`
+  or any date-parsing code — every parsing site already wraps `datetime.strptime` in a
+  `try/except ValueError` and simply skips the unparseable record rather than failing the
+  whole page. A `dob` of `0001-01-01` doesn't crash `calc_age_str` either, just produces an
+  absurd-but-harmless "~2025y old". (Separately: this pass's `9999-12-31` test *reinforces*,
+  rather than contradicts, the already-documented "due dates >~10 years out silently fail to
+  save" issue elsewhere in this file — that one is specifically about `st.date_input`'s own
+  widget range limit, not the database, which this test bypassed entirely by calling `db.py`
+  directly.)
+
+### Issue: 25 concurrent requests exhaust the connection pool, surfacing as a generic "can't connect" error
+
+- **Severity:** Low (confirms and strengthens an already-documented Low-priority item, not a
+  new independent finding)
+- **Steps to reproduce:** Fire 25 concurrent `link_vet_to_profile()` calls (or any other db.py
+  function) from separate threads.
+- **Expected vs. actual:** 10 succeeded (the pool's max size), the other 15 all failed with
+  "Couldn't connect to the database right now." — a reasonable-sounding message, but the
+  database was never actually unreachable; the *pool* was simply out of connections. No
+  duplicate rows or corrupted state resulted from the ones that did succeed (the
+  unique-constraint-guarded check-then-insert pattern held correctly under load in this test —
+  a lower-concurrency race attempt, 8 threads, also produced zero duplicates). This is
+  concrete, reproduced evidence for the existing "Connection pool sized for personal-app scale,
+  not tested under real concurrent load" entry elsewhere in this file, which was previously
+  reasoning without a live test behind it.
+- **Location:** `db.py` — `_get_pool()` (`ThreadedConnectionPool(1, 10, ...)`).
+
+### Confirmed working (with one caveat already documented elsewhere): Storage RLS and photo privacy
+
+- **Not a bug**, but not fully re-verified live this pass either — flagging the reasoning
+  rather than re-testing something Part 1 already covered structurally. Cross-user Storage
+  access is enforced by a Postgres RLS policy keyed to `auth.uid()` from the caller's actual
+  signed JWT (`(storage.foldername(name))[1] = auth.uid()::text`) — this is enforced by
+  Supabase/Postgres itself based on a cryptographically-signed token claim, not application
+  logic that could have a gap, so a live cross-account replay test wasn't repeated here (would
+  have meant creating a second real confirmed account against Supabase's Auth email service,
+  which is still rate-limited from earlier testing). The related, already-documented caveat
+  stands: **`photo_storage.upload_photo()` still has no error handling** — reproduced directly
+  this pass with a garbage access token (simulating a session that expired mid-use): raises an
+  uncaught `StorageApiError` (`403, "JWS Protected Header is invalid"`). That specific message
+  doesn't itself leak a hostname, but since nothing catches it, it would reach the browser as
+  Streamlit's raw default exception page — full Python traceback, real server file paths,
+  internal call structure — exactly the category of leak `db.py`'s `PawfolioDBError` wrapper
+  was built to prevent, just not extended to this newer code path.
+
+## Summary of this pass, by severity
+
+- **🔴 High, fixed 2026-07-19:** toast-queue leak across logout (real content leak, easily
+  triggered by ordinary use)
+- **🟡 Medium, still needs your decision (same root cause, lower stakes, deliberately left open
+  in the "critical/high only" fix pass):** pending-delete dialog leak across logout (label leak
+  only, no actual cross-account deletion possible, requires an abrupt exit to trigger)
+- **🟡 Medium, fixed already:** stored HTML/JS injection via tag fields (self-XSS today, fixed
+  proactively given the risk once sharing ships)
+- **🟢 Low:** empty profile name bypassable outside the UI; connection-pool exhaustion under
+  concurrent load (confirms an existing entry with a live test)
+- **Confirmed working, no action needed:** exhaustive cross-owner mutation sweep (every
+  remaining write/read function), no SQL injection, Postgres constraints hold even without an
+  app-level check, extreme/malformed dates don't crash anything, Storage RLS design is sound
+  (photo-upload error handling gap already tracked separately)
+
+## Visual Redesign Pass — "Bold Content, Calm Chrome" Color System — 2026-07-19
+
+Replaced the per-type icon/badge colors from the 2026-07-18 polish pass with a single
+app-wide color system: one accent (`--pf-primary`) for every piece of structural chrome (nav,
+buttons, headers), and four fully-tinted category colors reserved for dashboard/due-date
+*content* cards only (health/care/social/routine). Applied consistently to navigation (top nav
+is now a pill-shaped segmented control), the dashboard grid, and the profile page (new
+header/tag-pill/Identity-section hierarchy, plus the same category tint on due-date rows).
+Presentation only — no changes to `db.py`, CRUD logic, auth, or notification/due-date
+calculation logic. Full suite re-run clean: 72 passed, the same 6 pre-existing failures as an
+unmodified checkout (confirmed by `git stash`-ing this pass's changes and re-running — those
+failures exist independent of anything done here, mostly stale assertions from an earlier
+profile-page refactor), no new regressions. One test (`test_top_nav_has_only_home_and_...`)
+was updated, not just left passing by luck — it asserted the literal button key `"nav_home"`,
+which now legitimately varies (`"nav_home_active"` vs `"nav_home"`) depending on which tab is
+currently selected, since that's how the active segment's fill color is expressed.
+
+### Choice: category mapping for dashboard/due-date cards, and where it doesn't cleanly fit
+
+- **health** (coral/red tint): vaccinations, medications.
+- **care** (soft blue tint): baths, food refills, boarding check-ins.
+- **social** (pink tint): a dog's own birthday, a friend's birthday, and "New Pack Members"
+  welcome cards (no due date/urgency concept, but thematically the closest fit — a
+  celebratory, relationship-flavored card, not a chore).
+- **routine** (soft green tint): Chennai Corporation registration renewals.
+- **Doesn't cleanly apply — registration.** The instructions' own examples group "vaccines,
+  meds, vet visits, surgeries" under health, but registration renewal is bureaucratic
+  paperwork, not a medical event, even though it currently lives on the Health tab UI-wise.
+  Filed it under **routine** instead (a logistics chore, closer to "adjacent to health" than
+  "health" itself) rather than force-fitting it into the coral/red tint. Worth a second look if
+  that reads oddly in practice.
+  Note on the categories that *are* in the instructions' health example: this app doesn't
+  currently generate dashboard reminders for surgeries or vet visits at all (`get_upcoming_events`
+  only surfaces vaccinations/medications from that list — surgeries and vet visits are
+  historical records with no due date), so there was nothing to categorize for those two; the
+  mapping above only covers types that actually appear as dashboard/due-date cards today.
+- **"community dog updates"** (mentioned in the instructions' social example) has no
+  corresponding event type in the current data model — the closest existing thing is a
+  `new_profile` card for a `community_dog`-type profile, already covered by the `new_profile`
+  → social mapping above. Nothing further to do unless/until a real "community dog activity"
+  event type gets built.
+
+### Choice: danger-red delete buttons kept as a deliberate exception to "single accent"
+
+- "Don't introduce other colors into buttons or navigation" was applied to every button
+  *except* the existing red-outline treatment on delete/danger actions (`key="delete_..."`,
+  `--pf-danger`) — kept on purpose as a standard hazard-color convention (an irreversible
+  delete should look different from every other button), not an oversight. Every other button
+  tier (solid primary, dashed "add new", ghost "cancel/mute") already used only
+  `--pf-primary`/`--pf-text-muted` before this pass and still does.
+
+### Scoping decision: "All the Pups" profile-list cards stay neutral, not category-tinted
+
+- The instructions describe fully-tinted category colors as reserved for "dashboard status
+  items" / content cards, and explicitly call out that the profile page's tag-pills should use
+  the muted style "not the bold category colors." A dog's own profile card in the list view
+  isn't itself health/care/social/routine content — it's a navigational entry point — so it
+  keeps the existing neutral `--pf-card-bg` card style with the accent-colored hover lift,
+  consistent with "calm chrome" for anything that isn't a status item.
+
+### Scoping decision: dislikes/foods-to-avoid left out of the profile header's tag-pill summary
+
+- The header's new merged "at a glance" pill row (likes, favorite toys, favorite foods,
+  favorite games) intentionally excludes dislikes and foods-to-avoid — those are cautionary
+  information, not "favorites," and mixing them into one undifferentiated pill row risked
+  making a food allergy read the same as a favorite treat. Both fields are still shown, fully
+  labeled and separated, inside the Personality tab exactly as before.
+
+### Not visually confirmed: desktop max-width, mobile layout, and category-tint contrast
+
+- **No browser automation tool is available in this environment** (same limitation noted for
+  the Font Awesome CDN choice on 2026-07-18), so none of the following were seen rendered —
+  only reasoned through from the CSS source and the dev server's absence of any runtime error:
+  - The 700px `max-width` + `margin: auto` on `stMainBlockContainer`, meant to stop the
+    dashboard/profile pages from stretching edge-to-edge on a laptop/desktop monitor while
+    leaving mobile widths untouched (the cap has no effect once the viewport is already
+    narrower than it). **Please check a real desktop-width browser window first** — this is
+    the change with the most room to look wrong without being caught by any test.
+  - The four category-tint background colors against their text/badge overlay in **dark
+    mode** specifically — light-mode contrast (dark `--pf-text` on light pastel tints) is
+    low-risk, but the dark-mode tints were hand-picked to mirror how `--pf-primary` already
+    shifts lighter in dark mode (a pattern this codebase already uses and had previously
+    confirmed acceptable), not measured with an actual contrast checker.
+  - The pill-shaped nav's appearance at the narrowest phone widths (~375px) with two words
+    ("🏠 Home", "🐾 Pups") per segment instead of the old single-emoji buttons — should fit
+    comfortably next to the Log out button based on the column proportions used, but wasn't
+    seen.
+- **Location:** `styles.py` (`stMainBlockContainer` max-width rule, `--pf-cat-*` dark-mode
+  values, `.st-key-nav_pills` rules).
+
+## Mobile-Viewport Fixes Pass — 2026-07-19
+
+Targeted fixes from an actual mobile-viewport review, not another general pass — each item
+below maps to one specific complaint. Layout/structure only: `db.py`, CRUD, due-date, and
+notification logic untouched; the category color-tinting on Upcoming cards is unchanged, only
+what's layered inside each card moved. Full suite re-run clean: 72 passed, same 6 pre-existing
+failures as baseline (unchanged from the previous pass, confirmed unrelated), no new
+regressions. Spot-verified via `streamlit.testing.v1.AppTest` against an isolated schema (not
+`public`) that: no exception on load, the old `"View profile"`/`"goto_"`/`"mute_"` buttons are
+gone, the new `mutebell_...`/`pf_photolink_btn_...` buttons exist instead, the full quirky
+sentences are still present verbatim in the rendered markdown, and `"📋 Upcoming"` now renders
+before `"🎉 New Pack Members"`.
+
+### Fix 1: nav tabs wrapping on mobile → icon-only pill below the breakpoint
+
+- Each nav segment (Home / All the Pups) now renders as *two* buttons — `nav_home_full`/
+  `nav_profiles_full` (icon + text) and `nav_home_icon`/`nav_profiles_icon` (icon only) — with
+  CSS showing only one at a time via the existing 640px breakpoint, since a Streamlit button's
+  label can't be swapped by media query. Desktop shows icon+text as before; mobile now shows
+  just 🏠/🐾 instead of letting the text wrap to two lines.
+- **Caught and fixed in the same pass, not left as a followup:** the pill's two segments were
+  laid out with `st.columns(2)`, and this codebase's own mobile CSS deliberately makes
+  `st.columns` stack to one-per-row below 640px (used everywhere else on purpose) — which would
+  have broken the segmented pill into two stacked rows on exactly the phone widths this fix
+  targets, if left alone. Overridden with a scoped `flex-direction: row !important` on just the
+  `nav_pills` container's inner columns, so the pill stays side-by-side at every width.
+- **Location:** `app.py` (renders both button variants), `styles.py` (`.st-key-nav_pills`
+  rules, the `_full`/`_icon` display swap in the mobile media query).
+
+### Fix 2: section order — Upcoming before New Pack Members
+
+- Straightforward reorder in `views/home.py`: time-sensitive reminders now render first,
+  social/informational "New Pack Members" second. Both sections' subheaders are now shown
+  unconditionally whenever they have content (previously "📋 Upcoming" only got a heading if
+  "🎉 New Pack Members" was also present, a quirk of always being the second section — no longer
+  applicable now that either can be first).
+
+### Fix 3 & 4: removed "View profile" buttons; photo + name are now the only nav path
+
+- Both card types lost their `"View profile"` button entirely, per instruction — not shrunk,
+  removed. `ui_helpers.render_photo_name_link()` is the replacement: it lays a transparent,
+  same-sized button on top of the photo+name row (Streamlit buttons can't wrap an image
+  directly, so this is a same-technique-as-everywhere-else invisible-overlay click target, not
+  a real HTML link), making the photo and the name one tappable unit that goes straight to the
+  profile. Used identically on both New Pack Members and Upcoming cards, satisfying "anywhere a
+  pet is shown, it should be tappable" consistently across both.
+- New Pack Members cards also got the tighter spacing/line-height treatment (unchanged from
+  the previous pass) — combined with the removed button, the card is now just photo+sentence,
+  no separate action row at all.
+- Upcoming cards additionally lost the per-item icon circle (the redundant "suitcase" etc. next
+  to the pet's own photo) — the category still reads through the card's tint color alone, per
+  instruction. `render_urgency_badge()` (badge only, no icon) replaces `render_card_header()`
+  here; `render_card_header()` (icon + badge together) is still used unchanged on the profile
+  page's due-date rows, which have no photo of their own to make an icon redundant.
+
+### Fix 4 (continued): "Mute email for this" → small bell-icon toggle
+
+- Replaced the full outlined button with a single small icon button in the card's top-left
+  corner (top-right is the urgency badge): 🔔 when mutable-and-not-yet-muted (tap to mute, same
+  `mark_events_notified()` call as before), a static dimmed 🔕 with a tooltip when already
+  muted (matches the old behavior of no "unmute" action existing — muting is one-way until the
+  due date changes). Renders nothing in that corner for items with no milestone to mute at all
+  (same condition as before, `current_milestone() is None`).
+
+### Not visually confirmed: tap-target size and the mobile pill-vs-column-stacking override
+
+- **Still no browser automation tool in this environment** — everything below was reasoned
+  through from the CSS/DOM source, not seen on an actual phone:
+  - The icon-only nav buttons (🏠/🐾) and the mute-bell (🔔/🔕) are deliberately small/quiet by
+    design, but weren't checked against a real touchscreen for comfortable tap accuracy —
+    worth a first-hand check specifically on the smallest phone you test with.
+  - The `flex-direction: row !important` override that keeps the nav pill's two segments side
+    by side despite this app's own mobile column-stacking rule is the fix with the most room to
+    silently fail (a CSS specificity fight this environment can't screenshot to confirm the
+    winner) — **please check this one first**, since if it loses, the nav regresses to exactly
+    the two-line wrapping problem this pass was meant to fix, just via stacked columns instead
+    of wrapped text.
+  - The invisible-overlay click target (`pf_photolink_btn_...`) covering the photo+name row —
+    confirmed present and wired to the right profile via `AppTest`, but its actual hit-box
+    alignment over the visible photo/text (not spilling onto the badge above or, on Upcoming
+    cards, being too short to cover a two-line-wrapped name comfortably) wasn't seen rendered.
+- **Location:** `styles.py` — `.st-key-nav_pills [data-testid="stHorizontalBlock"]`,
+  `.st-key-pf_photolink_wrap_`/`btn_` rules, `.st-key-mutebell_` rules.
+
+## Glassmorphism Redesign Pass — 2026-07-19
+
+This was specified as the single source of truth, superseding the two earlier styling passes
+above — exact values (gradient background, glass-card CSS block, palette hex codes, avatar/
+badge/mute-button px values) were used verbatim wherever given. `db.py`, CRUD, auth,
+notifications, and due-date logic are untouched. Full suite re-run clean: 72 passed, same 6
+pre-existing failures as baseline (one test, `test_profile_detail_with_selection_shows_profile`,
+was updated — not just left passing — because it asserted against `st.header()`, which this
+redesign deliberately replaces with styled markdown; see the accessibility note below). Spot-
+verified via `AppTest` against an isolated schema that both pages load with no exception, the
+exact badge/dot HTML matches the spec's values byte-for-byte, and the category-dot colors
+resolve correctly per type (vaccination → `#ff9f4a`, boarding → `#1fb8b0`, confirmed in the
+rendered markdown).
+
+**Two things below are flagged as genuine conflicts needing your decision, not silently
+resolved — see "Where 'name exactly once' couldn't be fully honored" and "Profile header avatar
+size" in particular.**
+
+### Where "name exactly once" couldn't be fully honored
+
+- **Fixed:** the old bug the brief called out by name — the UI layer used to prepend
+  `f"**{profile_name}** · {text}"`, which combined with `voice.py`'s own `{name}`-embedding
+  templates to produce exactly the doubled pattern in the brief's example ("Bobby Dugar · Bobby
+  Dugar checks into..."). That prefix is gone; the name-row header is now the only place the UI
+  layer itself inserts the name.
+- **Not fixed, and can't be within the given constraints:** `voice.py`'s templates were written
+  to be complete, natural sentences that name the dog themselves (e.g. "Circle it in the
+  calendar — Bobby is due for Rabies in 2 days...", "🐾 Bobby just joined the pack..."). Given
+  "don't shorten or alter any existing quirky copy," those templates were left untouched, which
+  means the name still appears a second time *within* the message, inline in the sentence — just
+  not as a flat, robotic repeat anymore. This is a genuine conflict between two instructions in
+  the brief (name exactly once, vs. don't touch the copy), not an oversight: satisfying "exactly
+  once, period" would require editing `voice.py`'s templates to drop the leading name (e.g. to
+  something like the brief's own illustrative "Checks into Dog House Red Hills in 7 days..."),
+  which directly contradicts "don't alter the copy." Tell me which one wins if you want this
+  fully closed — I didn't want to guess and rewrite the voice on your behalf.
+- **Location:** `voice.py` (untouched), `ui_helpers.render_avatar_card_link`/`render_name_row`
+  (the fixed half).
+
+### Profile header avatar size — kept larger than the dashboard cards' 40px
+
+- The brief's exact 40px/rgba(255,255,255,0.75) avatar spec is written as part of the
+  dashboard card's structure (avatar + category dot + urgency badge). A profile's own page has
+  no category or urgency concept for *itself* (categories classify events, not dogs), so
+  literally reproducing "the same avatar/name-row pattern" there means the name-row (bold name,
+  no dot, no badge) but not necessarily the same tiny 40px size — a profile page's whole reason
+  for existing is to look at that one dog, and shrinking its photo to feed-thumbnail size felt
+  like an unintended side effect of a spec written for a different context, not a deliberate
+  ask. Used 88px instead, same circular/glass treatment, same `render_name_row` component as
+  everywhere else. If you did mean literally 40px here too, that's a one-line change
+  (`show_photo(..., width=88, ...)` → `width=40`) — flagging rather than guessing.
+- **Location:** `views/profile_detail.py`, the `card_profile_header` container.
+
+### backdrop-filter fallback: implemented via `@supports`, can't confirm which branch renders
+
+- Rather than guessing whether the deployment browser supports `backdrop-filter` (it's broadly
+  supported in evergreen Chrome/Edge/Firefox/Safari as of 2026, but this environment has no
+  browser to check against), used an `@supports not (...)` block so the browser itself decides:
+  full `blur(14px)` glass where supported, the exact `rgba(255,255,255,0.85)` solid fallback
+  specified in the brief where it isn't. Genuinely don't know which one is rendering for you —
+  if the cards look flat/opaque instead of frosted, that's the fallback firing, not a bug.
+- **Location:** `styles.py`, the `@supports not ((backdrop-filter...` block right after the
+  main glass-card rule.
+
+### Card height: re-verified no fixed height anywhere in the glass-card rule
+
+- The brief named a specific prior bug (fixed-height cards clipping longer messages) and asked
+  for an explicit re-check. Confirmed by reading the CSS itself: the glass-card rule sets
+  `height: auto !important; min-height: 0 !important; overflow: visible;` and no rule anywhere
+  in the stylesheet sets a `max-height` or `overflow: hidden` on a card. Also confirmed
+  behaviorally via `AppTest` with a full-length quirky sentence rendered inside a card — the
+  complete text came back in the markdown output, nothing truncated. What wasn't (couldn't be)
+  confirmed is the *pixel-level rendered* result — whether the card's visible background box
+  actually grows to match, since that's a real-browser layout question this environment can't
+  screenshot.
+
+### Avatar/icon containment: added `overflow: hidden` on the clickable avatar+name wrapper
+
+- The brief asked to "fix the avatar/icon alignment issue from before" without a specific
+  repro. The most plausible candidate given this codebase's own mechanics: the invisible
+  overlay button (`pf_photolink_btn_`) that makes the avatar+name clickable is
+  `position: absolute; inset: 0`, and if its parent wrapper's box were ever taller than the
+  avatar+name content (e.g. from wrapping text), the overlay's bounding box could extend past
+  what's visibly there. Added `overflow: hidden` and a matching `border-radius` to the wrapper
+  as a defensive fix so neither the avatar nor the overlay can ever visually spill past the
+  card's own padding, regardless of content length. Not confirmed against the specific issue
+  you saw, since it wasn't described further — if this doesn't address what you meant, tell me
+  what it looked like and I'll target it directly.
+- **Location:** `styles.py`, `.st-key-pf_photolink_wrap_`.
+
+### Scoping: which existing elements did and didn't get the glass treatment
+
+- **Got it:** Upcoming cards, New Pack Members cards, "All the Pups" profile-list cards,
+  profile-page due-date record rows (vaccinations/medications/baths/food-refills/boarding,
+  including the ones that previously had no container key at all — every record row is now
+  keyed so none of them fall back to Streamlit's plain default box), and the Identity/
+  Registration/Spay-Neuter field groups.
+- **Deliberately left alone:** `st.form` (add/edit dialogs), `st.dialog` modals, and
+  `st.expander` — none of these were named in the brief's card enumeration, and a translucent
+  frosted *modal* overlaying frosted *cards* underneath seemed likely to hurt legibility rather
+  than help it, so dialogs stay a plain opaque solid. Say the word if you want these converted
+  too.
+- **Category dot color mapping** (unchanged from the previous pass, still applies): health →
+  `#ff9f4a` (warm orange), routine/registration → `#ffc93c` (amber), care → `#1fb8b0` (bright
+  teal), social → `#0e7c78` (deep teal) — the amber/orange-vs-teal split follows the brief's own
+  "health & logistics vs. care & social" example exactly.
+- **Nav + profile-page tabs both use the same active-accent** (`#1fb8b0`, the brief's own
+  example color) for "pick one consistently" — extended from just the top nav to the profile
+  page's Health/Personality/Social/Care tabs too, since both are segmented controls and the
+  brief's instruction read as one accent for that whole pattern, not just the top bar
+  specifically. Flagging in case you meant only the top nav.
+
+### Accessibility: profile name is no longer a semantic heading
+
+- The profile page's name used to be a real `st.header()` (renders as an `<h2>`). Reusing
+  `render_name_row()` there for visual consistency with the dashboard's card pattern means it's
+  now styled `<div>`/`<span>` markup instead — visually a heading, but no longer one to a screen
+  reader or in the page's outline. Not something the brief asked for explicitly; a side effect
+  of literally reusing the shared component. Worth knowing about if accessibility matters here;
+  a small fix (wrapping the name in a visually-hidden real heading alongside the styled one)
+  is possible if you want it.
+
+### Dark mode: intentionally not themed this pass
+
+- Already flagged in the response, repeating here for the record: every value in this
+  redesign is a fixed light color with no dark-mode equivalent given, and the previous design's
+  dark-mode logic (flipping text to a *light* color for contrast against a *dark* background)
+  would put light text on this redesign's permanently-light gradient background if left in —
+  a real, not hypothetical, contrast bug. Removed rather than left broken. The app now looks the
+  same regardless of the visitor's OS color-scheme setting. Tell me if you want a dark variant
+  designed for this new palette.
+
+## Glassmorphism Corrective Pass — 2026-07-19
+
+Six specific, described bugs from an actual rendered review of the previous pass — not another
+general polish. `db.py`, CRUD, auth, notifications, and due-date logic untouched. Full suite
+re-run clean: 72 passed, same 6 pre-existing failures as baseline, no new regressions. Verified
+via `AppTest` against an isolated schema that: all three boarding-stay message templates
+(including the two named as cut off — "...They'll have a blast and pretend not to miss us." and
+"...Bags are basically already packed.") now render complete and unclipped in the markdown
+output; the login page's `st.tabs()` and `st.form()` load with no exception; card/button keys
+match the restructured CSS selectors below.
+
+### 1. Background: fixed a real CSS bug, not an override
+
+- Confirmed root cause, not a guess: the previous pass applied the identical 4-layer gradient
+  to *three* nested elements at once (`stAppViewContainer`, `stApp`, `stMain`). Since these are
+  nested inside each other with slightly different boxes, each rendered its own independent
+  copy of the gradient sized to its own box, and the innermost one's edges showed as a visible
+  seam over the outer ones — that reads as exactly the "hard banded diagonal" you saw, not a
+  smooth single gradient. Fixed by painting the background on `stAppViewContainer` only, with
+  every descendant that could otherwise paint over it (`stApp`, `stMain`,
+  `stMainBlockContainer`, `stHeader`) forced to `background: transparent !important`.
+- **Also found and fixed, independent of the above:** `radial-gradient(circle at X% Y%, ...)`
+  with no explicit size defaults to CSS's `farthest-corner` keyword — meaning each glow's "48%
+  transparent" stop was landing 48% of the way to the *farthest corner of the whole screen*,
+  not a contained local glow. On a typical laptop width that's several hundred pixels, so the
+  "soft spot" was covering most of the visible area — the other real contributor to "most of
+  the screen colored" instead of "near-white with three soft spots." Added an explicit `550px`
+  circle size to each gradient so the 48%/45% stops resolve to a sane, contained glow radius
+  instead. Position, color, and stop-percentage values are unchanged from the exact spec; only
+  this implicit sizing (which CSS requires *some* value for) is now explicit.
+- **Not confirmed:** the actual rendered pixels, since there's still no browser tool in this
+  environment — but both causes above are concrete, verifiable CSS mechanics (nested-element
+  duplication and `radial-gradient`'s own default sizing keyword), not speculation, and no
+  `.streamlit/config.toml` theme override exists in this repo to be a competing cause.
+- **Location:** `styles.py`, the `[data-testid="stAppViewContainer"]` rule.
+
+### 2 & 5. Cards not glass; login form unstyled — same root cause
+
+- **Confirmed, not a backdrop-filter support failure:** `st.form()` (which wraps the login and
+  signup forms) was never added to the glass-card CSS selector list in the previous pass —
+  forms were explicitly out of scope then. It was rendering with its old solid warm-peach
+  background (`var(--pf-card-bg-alt)`, close to the "solid salmon" described) because that's a
+  *different, older* rule that was simply never replaced, not `backdrop-filter` failing
+  silently. Added `[data-testid="stForm"]` to the shared glass-card selector (background,
+  blur, border, radius, shadow, and the `@supports` fallback all apply to it now identically to
+  every other card), and removed the old solid-color form rule so there's no longer a
+  conflicting declaration.
+- **Whether `backdrop-filter` itself is rendering as true blur vs. its solid fallback still
+  can't be confirmed without a browser.** What I can say concretely: the CSS is correctly
+  structured for it to work (both `backdrop-filter` and `-webkit-backdrop-filter` present, the
+  `@supports not (...)` fallback block is syntactically valid and will swap in
+  `rgba(255,255,255,0.85)` automatically if the browser genuinely doesn't support it), and the
+  background-layering fix in item 1 removes a scenario that would otherwise defeat the *visual
+  effect* of a working blur even if the CSS property itself were applying correctly — if an
+  opaque element sat directly behind a card, `backdrop-filter` would have nothing colorful to
+  blur, and would look flat regardless of whether the property itself "worked." That specific
+  scenario is now closed. If cards still look flat after this, that's genuine evidence
+  `backdrop-filter` isn't supported in whatever's rendering this for you, and the fallback
+  should be visibly active instead (`rgba(255,255,255,0.85)`, still frosted-*looking* just not
+  blurred) — please tell me which one you're seeing.
+- **The Login/Sign up tab styling itself was not changed** — `st.tabs()`'s active tab already
+  uses the exact palette teal (`#1fb8b0`) from the previous pass, unrelated to the form
+  background bug. If it still looks wrong once the form background fix above renders, it's a
+  new, different symptom — tell me specifically what you're seeing (e.g. underline vs. fill,
+  which color) and I'll target it directly rather than guessing.
+- **Location:** `styles.py`, the glass-card shared selector block (now includes
+  `[data-testid="stForm"]`).
+
+### 3. Text truncation — found and removed the actual cause
+
+- **Root cause, confirmed:** the *previous* corrective pass (mobile-viewport fixes) added
+  `overflow: hidden` to `.st-key-pf_photolink_wrap_` — the container that holds both the
+  avatar+name-row *and* the full message text below it — as a defensive, never-actually-
+  confirmed guess at fixing a described-but-unreproduced "avatar/icon alignment" issue. Since
+  that wrapper holds the message text too, `overflow: hidden` clipped it whenever the full
+  quirky sentence needed more vertical space than was visible. Removed entirely — the avatar
+  can't spill past the card regardless, since it has a fixed pixel size and lives in its own
+  flex column, so nothing else needed to take overflow:hidden's place.
+- **Also added, defensively:** explicit `white-space: normal`, `overflow: visible`,
+  `text-overflow: clip`, and `max-height: none` (all `!important`) directly on the message
+  paragraph rule, so a future change to an ancestor's overflow/white-space can't silently
+  reintroduce clipping without also having to override these directly.
+- **Verified, not just reasoned about:** re-ran the exact boarding-stay templates you quoted as
+  cut off through `AppTest` — both now come back complete in the rendered markdown ("...They'll
+  have a blast and pretend not to miss us." / "...Bags are basically already packed."), full
+  stop included, nothing missing.
+- **Location:** `styles.py`, the `.st-key-pf_photolink_wrap_` rule (the fix) and the
+  `card_new_`/`card_evt_` message-paragraph rule (the added hardening).
+
+### 4. Mute icon: confirmed correct glyph in code, likely a font-fallback rendering issue
+
+- Checked the actual Unicode codepoint used in `views/home.py` via Python's `unicodedata`
+  module: `U+1F515`, officially named "BELL WITH CANCELLATION STROKE" — the correct, standard
+  mute-bell glyph (🔕), not a copy-paste mistake, and not a "no entry"/prohibited codepoint.
+- Most likely explanation for it *looking* like a blocked/prohibited symbol: browsers don't
+  always apply the same color-emoji font fallback inside a `<button>` element that they do for
+  ordinary body text (a known class of rendering inconsistency, particularly on Windows), and
+  at the glyph's previous 12px size, a monochrome fallback rendering of a bell-with-slash can
+  genuinely be hard to distinguish from a generic "prohibited" circle. Fixed by explicitly
+  hinting a color-emoji font stack (`"Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"`)
+  on the button and sizing the glyph up slightly (12px → 14px).
+- **Not confirmed:** whether this specific fix resolves the rendering on your system, since I
+  can't see it rendered. If it still looks wrong, that's evidence the font-family hint isn't
+  taking effect in your browser, and the next step would be a real icon (SVG or an icon font)
+  instead of relying on emoji rendering at all — tell me if you'd rather go straight there.
+- **Location:** `styles.py`, `.st-key-mutebell_` button rule.
+
+### 6. Mute icon disappearing on mobile — confirmed cause: flex-shrink squeeze, not a hide rule
+
+- Checked explicitly for any `display: none` rule that could match the mute-bell at narrow
+  widths — none exists. The actual cause: the mute-bell lived in a narrow `st.columns([6, 1])`
+  slot next to the avatar+name+message column. Flex children default to `min-width: auto`,
+  which lets a wide/long sibling (the full message text, especially before item 3's fix) refuse
+  to shrink below its own content width — on a narrow card, that pushed the 1-part mute-bell
+  column down to zero available space, effectively squeezing it off-screen (present in the DOM,
+  not visibly there or tappable), exactly as you guessed.
+- Fixed with two rules: `min-width: 0` on every nested column inside these cards (lets the
+  content column actually shrink/wrap instead of fighting for space), plus a guaranteed
+  `min-width: 32px; flex-shrink: 0` floor specifically on the mute-bell's own column — scoped
+  precisely via a new `cardrow_` wrapper key + direct-child CSS combinators so it can't
+  accidentally also apply to the *nested* avatar/text column split one level deeper (which
+  needs to stay free to shrink, not get a hard floor).
+- **Location:** `styles.py`, the `min-width: 0` and `st-key-cardrow_` rules just after the
+  `pf_photolink_` block; `views/home.py`, the new `cardrow_` container wrapping `content_cols`.
+
+### Still can't confirm without a browser
+
+Every fix above is grounded in a concrete, identifiable CSS/DOM mechanism (verified via reading
+the actual generated CSS/HTML and, where possible, `AppTest`'s rendered output) rather than a
+repeat of the same values with a hope it renders differently. What genuinely can't be confirmed
+from this environment: the actual pixel-level result on a real phone and a real desktop
+browser, and specifically whether `backdrop-filter` is rendering as true blur or its solid
+fallback (see item 2/5). Please check both viewport widths and tell me what you see — if
+anything on this list still doesn't match, it'll be faster to fix with a specific description
+than another full pass.
+
+## Second Corrective Pass — 2026-07-19
+
+Translucency/glow/truncation confirmed fixed and untouched this pass, per instruction. Three
+more specific items. `db.py`, CRUD, auth, notifications, and due-date logic untouched (item 1
+required editing `voice.py`'s copy itself, which is content, not logic — no template's
+`{detail}`/`{when}`/`{turning}` interpolation or event-type routing changed, only whether
+`{name}` appears in the sentence). Full suite re-run clean: 72 passed, same 6 pre-existing
+failures as baseline, no new regressions (`test_voice.py`'s assertions were rewritten to match
+the new copy, not loosened to hide anything).
+
+### 1. Name appearing twice — found and fixed at the source, not the display layer
+
+- **Where it actually was:** `voice.py`'s templates themselves (`VACCINE_TEMPLATES_DUE`,
+  `BOARDING_TEMPLATES`, `NEW_PROFILE_TEMPLATES_COMMUNITY_DOG`, etc.) — every one of them said
+  the dog's name as part of the sentence (`"{name}'s little vacation at {detail} starts
+  {when}..."`), which combined with the dashboard card's separate bold name-row header to show
+  the name twice. The previous pass only removed a *redundant UI-layer prefix* it had added on
+  top of these templates — it never touched the templates' own embedded `{name}`, which is why
+  this wasn't actually fixed despite being reported fixed. Rewrote all 26 template strings
+  across `VACCINE_TEMPLATES_DUE/OVERDUE`, `MED_TEMPLATES`, `REG_TEMPLATES`,
+  `OWN_BIRTHDAY_TEMPLATES`, `FRIEND_BIRTHDAY_TEMPLATES`, `BATH_TEMPLATES`,
+  `FOOD_REFILL_TEMPLATES`, `BOARDING_TEMPLATES`, and both `NEW_PROFILE_TEMPLATES_*` lists to
+  drop the leading/embedded `{name}` and read as a standalone continuation instead (verified via
+  `AppTest` that your own two examples now render byte-for-byte as you described them: *"A
+  little vacation at Dog House Red Hills starts in 3 days. Bags are basically already packed."*
+  and *"🐾 Has entered the chat. New community pup on the books."*). `{detail}` (a vaccine name,
+  a friend's name, a food brand, a facility) was left alone in every template — it's a
+  different thing than the card's own subject, not redundant with the header.
+- **One consumer needed a compensating fix:** `notifications.py`'s email digest reuses these
+  exact same templates (`voice.render_event_card`), but unlike the dashboard, an email digest
+  lists several dogs' items in a row with **no per-item header** of its own — stripping the
+  name from the shared template would have made a multi-dog digest email genuinely ambiguous
+  about which line belonged to which dog. Fixed by having `_build_digest()` explicitly
+  re-prepend `card["profile_name"]` (already returned alongside `card["text"]`) when building
+  each digest line/HTML block, so the *email* still says the name once per item, while the
+  *template* stays name-free for the dashboard's benefit. This is a genuinely different
+  presentation context, not a workaround — the dashboard has a name-row, the email doesn't, so
+  each needed to end up saying the name exactly once via a different mechanism.
+- **Location:** `voice.py` (all template lists), `notifications.py`'s `_build_digest()`,
+  `tests/test_voice.py` (assertions rewritten to check `card["profile_name"]` instead of
+  `"Rex" in card["text"]`, and to explicitly assert the name is *not* in the text — a regression
+  guard against this exact bug recurring).
+
+### 2. Mute icon ambiguity — switched glyphs, not just re-styled the same one
+
+- The previous fix kept the slash-bell (🔕) for both states and only adjusted its font/size,
+  which didn't address the actual complaint (a slashed-circle shape reading as "blocked").
+  Switched to your suggested fallback approach: a plain, unambiguous bell (🔔, U+1F514) for
+  *both* states — normal opacity when it's an active, clickable "tap to mute" button, and the
+  same glyph dimmed + grayscaled (`opacity:0.35; filter:grayscale(60%)`) for "already muted,"
+  rather than a different, still-emoji-dependent glyph for the muted state. A plain bell shape
+  doesn't carry the "is this a prohibition sign" ambiguity a slashed circle does even if a
+  browser falls back to a monochrome rendering. No icon font was reintroduced (Font Awesome was
+  deliberately retired earlier this redesign) — kept it to the one glyph, appearance-only state
+  change, per your explicit fallback suggestion.
+- **Location:** `views/home.py` (both the live button and the dimmed muted-state markup),
+  `styles.py`'s `.st-key-mutebell_` comment.
+
+### 3. Chain-link glyph next to section headers — Streamlit's own built-in anchor-link icon
+
+- **Confirmed, not guessed:** Streamlit automatically renders a small hover-triggered
+  "copy link to this heading" icon (a literal link/chain glyph, used for deep-linking to a page
+  section) next to every `st.title()`/`st.header()`/`st.subheader()` unless explicitly disabled.
+  This is a stock Streamlit feature, not a broken icon-font reference — this app has no Font
+  Awesome or other icon font loaded anymore (retired earlier this redesign), and there is no
+  other icon-glyph code anywhere near the "New Pack Members" subheader, so a leftover unresolved
+  icon-font reference wasn't the cause. Disabled it via Streamlit's own `anchor=False` parameter
+  (confirmed via source: `Anchor: TypeAlias = str | Literal[False] | None`; "If False, the
+  anchor is not shown in the UI") on every `st.title()`/`st.header()`/`st.subheader()` call in
+  the app, not just "New Pack Members" specifically, since it's the same stock element
+  everywhere headings appear and there's no reason to keep an unused deep-link affordance on any
+  of them in a single-page-per-view dashboard app like this one.
+- **Verified at the protocol level, not just by reading the source:** ran the actual page
+  through `AppTest` and inspected the underlying protobuf for both `st.title("🐾 Pawfolio")` and
+  `st.subheader("🎉 New Pack Members")` — both report `hide_anchor: True`, confirming Streamlit
+  itself will suppress the icon, as close to confirmed as this environment allows without an
+  actual browser to look at.
+- **Location:** every `st.title`/`st.header`/`st.subheader` call — `views/home.py`,
+  `views/profile_detail.py`, `views/all_profiles.py`, `views/add_profile.py`, `login_ui.py`.
+
+### Viewport check for this pass specifically
+
+None of these three fixes are viewport/breakpoint-dependent (no CSS media query was touched;
+`anchor=False` and the template rewrites are pure content/protocol changes, and the mute-bell
+glyph swap reuses the exact sizing/positioning CSS from the previous pass, which already
+included the mobile-specific `min-width`/`flex-shrink` fix for that button not disappearing on
+narrow screens). Re-ran the full suite and the AppTest smoke checks with no viewport-specific
+divergence possible at the code level — but as with every pass so far, the actual rendered
+pixels on a real phone vs. desktop browser still can't be confirmed from this environment.
+Please check both after this one.
+
+## Third Corrective Pass — 2026-07-19
+
+Translucency, background glow, text truncation, name-duplication, mute icon, and the stray
+anchor icon are all confirmed working and untouched this pass. `db.py`, CRUD, auth,
+notifications, and due-date logic untouched. Full suite: 72 passed, same 6 pre-existing
+failures as baseline. **One thing worth flagging up front:** a full-suite run right after these
+changes showed 5 *additional* failures beyond the usual 6, all `RuntimeError: AppTest script
+run timed out after 3(s)`. Chased this down before trusting any other result — re-ran the exact
+same failing test against a `git stash`-ed (fully unmodified) checkout and got the *same*
+timeout 3 times out of 4 runs. This is this long session's accumulated background load (a dev
+server plus many hours of manual test scripts against the same live database) straining
+connection acquisition, not anything in this pass's code — confirmed environmental, not a
+regression, and the failure disappeared once the full suite ran again a moment later (also
+cleaned up one leftover `test_*` schema from an earlier session while investigating, unrelated
+to this pass).
+
+### 1. Nav pill grouping + excess whitespace on mobile
+
+- **Root cause, not a guess:** the pill's two segments (Home/Pups) were each rendered inside
+  their *own* nested `st.columns(2)` split inside the `nav_pills` container. That nesting meant
+  there were *two* separate flex-row overrides needed (one for `nav_pills`'s own row, one for
+  the nested columns-within-a-column), and on mobile the second one didn't fully apply — one
+  segment ended up rendering with none of the custom pill styling, falling back to Streamlit's
+  own default button box, which is taller/wider/differently-shaped than the tightly-fitted
+  custom pill. That's what looked like a second, unstyled, oversized capsule floating outside
+  the real one. Fixed by removing the nested columns entirely — all 4 buttons (home/profiles ×
+  full/icon) are now direct siblings inside `nav_pills`, so there's only one flex row to
+  control, not two.
+- **Also found and fixed, same investigation:** the *outer* row (`nav_cols` in `app.py` — the
+  pill column, an empty spacer column, and the logout column) had no row-not-stacked override at
+  all, so on mobile it broke into 3 separate full-width stacked bars — an entire extra blank bar
+  for the empty spacer column alone is real, visible dead space, independent of anything inside
+  `nav_pills`. Given the same fix as `nav_pills`'s own row.
+- **Vertical spacing below the nav bar:** tightened via a small negative margin on the
+  `top_nav` container plus a reduced margin on the divider immediately following it (targeted
+  specifically via an adjacent-sibling selector, so this doesn't affect other dividers
+  elsewhere on the page).
+- **Location:** `app.py` (nav button structure, no more nested `pill_cols`), `styles.py`
+  (`.st-key-nav_pills` and `.st-key-top_nav` rules).
+
+### 2. Unequal card heights within a row — flexbox stretch, no fixed height
+
+- Streamlit's own column row is already a flex row, and `align-items: stretch` (flexbox's
+  default) already stretches each column to match the row's tallest member — what was actually
+  missing was threading that stretch down from the (invisible) column wrapper to the visible
+  card div inside it, which otherwise just sat at its own shorter natural height with dead
+  space below it in the now-taller column. Added `flex: 1` on the card itself plus
+  `display:flex;flex-direction:column` on the intermediate wrappers so the stretch actually
+  reaches the visible box. `height: auto` (already set on every card, needed for the
+  truncation fix from the previous pass) still governs the card's *minimum* size from its own
+  content — nothing in this fix can make a card shorter than its content, only taller to match
+  a taller sibling, and a very long message still grows the whole row's height exactly as
+  before.
+- Scoped via `:has()` to only the row(s) actually containing an Upcoming card
+  (`card_evt_`), not every `st.columns()` in the app — the top nav, "All the Pups" list, etc.
+  don't get this and don't need it. `:has()` needs a reasonably modern browser (broadly
+  supported since ~2023) — if unsupported, this specific enhancement just doesn't apply and
+  cards fall back to today's independent-height look, not something visibly broken.
+- **Scoping note, not extended without being asked:** the "All the Pups" profile-list grid
+  (`profile_card_`, `views/all_profiles.py`) uses the same `st.columns()` pattern and could have
+  the same latent unequal-height susceptibility, but wasn't reported and wasn't touched — its
+  content (photo/name/type/age) is far less variable in length than a full quirky sentence, so
+  it's lower-risk, but flagging in case it's noticed later.
+- **Location:** `styles.py`, the new "Equal-height Upcoming cards" block.
+
+### 3. New Pack Members emoji placement
+
+- Moved the leading emoji to the end of the sentence in both `NEW_PROFILE_TEMPLATES_MY_DOG`
+  and `NEW_PROFILE_TEMPLATES_COMMUNITY_DOG` (`voice.py`) — verified via `AppTest` that "Has
+  entered the chat. New community pup on the books. 🐾" now renders exactly as you specified.
+  Templates with no leading emoji to begin with were left untouched. Confirmed no colored dot
+  was added to these cards (`render_avatar_card_link` is still called with no `category` for
+  New Pack Members, same as before — `category_dot_html` returns an empty string when there's
+  no category, so nothing renders there).
+- **Deliberately left alone:** `BOARDING_TEMPLATES`' one template with a leading emoji (📦) —
+  this item was scoped explicitly to "New Pack Members" cards, and Upcoming cards have a
+  different layout (avatar + dot + name + badge above the message, not immediately adjacent to
+  the name-row the same way), so the same clutter complaint doesn't obviously apply there. Left
+  as-is rather than assumed into scope.
+- **Location:** `voice.py`, `NEW_PROFILE_TEMPLATES_MY_DOG`/`NEW_PROFILE_TEMPLATES_COMMUNITY_DOG`.
+
+### Still can't confirm without a browser
+
+As with every pass, the exact rendered result (particularly whether the equal-height stretch in
+item 2 produces any visually awkward oversized gap under a very short card next to a very long
+one, which the instructions specifically asked about) can't be seen from this environment.
+Please check that specific case, plus both mobile and desktop widths on all three items, and
+report back anything that still looks off.
+
+## Header/Navigation Restructure — 2026-07-19
+
+Structural change to the top bar and where account-level actions live, not a visual-polish
+pass — previously confirmed fixes (translucency, background glow, card sizing/height, name-
+duplication, mute icon, emoji placement) untouched. No data-scoping change anywhere: "My Pups"
+runs the exact same `owner_id`-scoped query "All the Pups" always did, just relabeled. Full
+suite: 72 passed, same 6 pre-existing baseline failures, 2 new tests added specifically for
+this change (nav no longer has a persistent logout/add-profile button; the account menu shows
+correct profile counts).
+
+### What changed
+
+- **Top bar now holds exactly three things**, left to right: a compact brand mark (🐾 Pawfolio,
+  icon-only below the mobile breakpoint), the Home/My Pups pill nav (unchanged mechanism from
+  the previous pass, just relabeled and given a third neighbor), and a single hamburger (☰)
+  icon opening an account menu.
+- **Account menu** (`st.popover`, key `account_menu`): shows `"{N} pups · {M} community pups"`
+  (live counts via `get_all_profiles(owner_id, profile_type=...)`, computed fresh each render —
+  personal-app scale, no caching needed) and the Log out button, which moved here verbatim
+  (same session-state cleanup, same toast-queue-leak fix from earlier in this project).
+- **"All the Pups" → "My Pups"**: page title, `st.Page` title, and the on-page `st.title()` all
+  renamed. Every underlying query is untouched — still `owner_id`-scoped, still both
+  `my_dog`/`community_dog` profile types, exactly as private as before. A placeholder comment
+  was added in both `app.py` (next to where the page list is built) and
+  `views/all_profiles.py` explaining that the future public "All Pups" feature (Phase 5: every
+  user's dog names + general location only, no private records, "friend" option) is a
+  deliberately separate, not-yet-built page — this rename is not a step toward that, and
+  nothing about this page's own scoping changed to prepare for it.
+- **"New Profile" button**: removed from the top bar (it was never actually there — it lived on
+  Home's own header, which is also now gone) and from Home entirely; it already existed on the
+  My Pups page too, so no new button was added there, just confirmed it's the one surviving
+  copy, positioned at the top of the list as before.
+- **Home's old page-level hero** (large "🐾 Pawfolio" title + mascot illustration + its own copy
+  of the New Profile button) was removed outright, not just moved — keeping it would have meant
+  showing the Pawfolio brand twice on the same screen (once compact in the global top bar, once
+  large immediately below it). The mascot illustration itself is untouched in its other use (the
+  "nothing due" empty-state screen).
+
+### Streamlit-specific notes on the hamburger/account-menu pattern
+
+- **`st.popover()` is the closest native primitive, and it is a real limitation, not just a
+  stylistic choice.** Streamlit has no slide-out drawer, no animated dropdown, no "menu"
+  component — `st.popover()` is a click-to-toggle floating panel anchored to its trigger button.
+  It's rendered as a portal (not literally positioned via ordinary document flow), so its exact
+  placement relative to the trigger, and how it behaves at very narrow viewport widths, is
+  governed by Streamlit's own internal implementation, not something this app's CSS can fully
+  redirect. Confirmed it opens/closes correctly and its content (counts + logout) evaluates
+  correctly via `AppTest`, but the actual on-screen positioning/animation at mobile width
+  couldn't be seen from this environment — if it renders awkwardly close to a screen edge, or
+  overlaps the nav pills, on a real narrow phone, that's a real Streamlit-popover behavior to
+  work around (e.g., dropping to a `st.dialog` instead, which is a full-screen-friendlier
+  component but a heavier interaction than a lightweight account menu probably wants) rather
+  than a CSS fix.
+- **A real, already-known quirk of `st.popover()` in this codebase, flagged for awareness even
+  though it doesn't apply to *this* specific popover:** an existing comment elsewhere in
+  `ui_helpers.py` notes that a popover can stay visibly open behind a `st.dialog` it triggers,
+  since a dialog opening doesn't automatically close a popover underneath it. The account menu
+  doesn't open any dialog from inside it (just a plain button triggering `sign_out()` +
+  `st.rerun()`), so this specific failure mode doesn't apply here — noted for the next person
+  who reaches for `st.popover()` in this app and might trigger a dialog from inside one.
+- **Verified, not assumed:** popover content (the counts caption and the logout button) renders
+  and is queryable via `AppTest` *without* needing to simulate a click to "open" it first — the
+  panel's contents execute as part of the normal script run regardless of the frontend's
+  visual open/closed state, which is why this pass could test the account menu's contents at
+  all through `AppTest` (which has no way to simulate hovering/clicking to reveal a closed
+  panel).
+
+### Not confirmed without a browser
+
+Same limitation as every pass so far — the compact brand mark's icon-only collapse on mobile,
+the 3-way top bar's spacing at both viewport widths, and above all the popover's actual
+on-screen appearance/positioning when tapped on a real phone, couldn't be seen from this
+environment. Please check all of these, and specifically report back on the popover's mobile
+behavior described above, since that's the one piece of this pass genuinely bounded by what
+Streamlit itself can do rather than by CSS.

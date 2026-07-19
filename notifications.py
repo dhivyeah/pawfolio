@@ -89,11 +89,19 @@ def _build_digest(events: list) -> tuple:
     for event in events:
         card = voice.render_event_card(event)
         color = _TIER_COLORS[_urgency_tier(event["days_until"])]
-        text_lines.append(f"- {card['text']} ({card['tag']})")
+        # voice.py's templates deliberately don't say the dog's name anymore (the
+        # dashboard shows it as a separate bold header next to each card, so the
+        # template repeating it there would read twice) -- but a digest email lists
+        # several dogs' items in a row with no such per-item header of its own, so
+        # this is the one place that still needs the name stitched back on, using
+        # the profile_name render_event_card already returns alongside the text.
+        text_lines.append(f"- {card['profile_name']}: {card['text']} ({card['tag']})")
         html_items.append(f"""
         <div style="padding:12px 16px;margin-bottom:10px;background:#FFF3E6;
                     border-left:4px solid {color};border-radius:10px;">
-          <div style="color:#4A3225;font-size:15px;line-height:1.5;">{card['text']}</div>
+          <div style="color:#4A3225;font-size:15px;line-height:1.5;">
+            <strong>{card['profile_name']}</strong> — {card['text']}
+          </div>
           <div style="color:{color};font-size:12px;font-weight:600;margin-top:4px;">{card['tag']}</div>
         </div>""")
     text_lines += ["", outro]

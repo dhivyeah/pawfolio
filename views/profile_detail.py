@@ -14,9 +14,10 @@ from db import (
     add_boarding_stay, get_boarding_stays, update_boarding_stay, delete_boarding_stay,
 )
 from ui_helpers import (
-    show_photo, save_uploaded_photo, show_tag_pills, render_vet_picker,
+    show_photo, save_uploaded_photo, show_tag_pills, tags_to_list, render_vet_picker,
     request_delete, render_pending_delete_dialog, queue_toast, render_queued_toast,
-    render_card_header, days_until_from_iso,
+    days_until_from_iso, category_for_type, category_dot_html, urgency_badge_html,
+    render_field_group, render_name_row,
 )
 
 # Module-level rather than threaded through every dialog function's parameters below --
@@ -54,11 +55,25 @@ def _record_row(summary: str, key: str, on_click, icon_type: str = None, due_iso
 
     icon_type/due_iso are optional -- only record types with an actual due date
     (vaccinations, non-ongoing medications, baths, food refills, boarding check-ins)
-    pass them, to show the same icon-circle + urgency badge header the dashboard uses;
-    records with no due-date concept (surgeries, vet visits, friends) render plain."""
-    with st.container(border=True):
+    pass them, to show the same category dot + urgency badge the dashboard uses (no
+    icon circle here -- retired app-wide this pass in favor of the small dot, see
+    ui_helpers.category_dot_html). Every record row gets the same glass-card
+    treatment (styles.py's "card_" prefix match covers both the "card_rec_health_"
+    style keys below and the plain "card_rec_plain_" one) regardless of whether it
+    has a category, so surgeries/vet-visits/friends aren't visually a different
+    kind of box from vaccinations/medications."""
+    category = category_for_type(icon_type) if icon_type is not None else None
+    container_key = f"card_rec_{category}_{key}" if icon_type is not None else f"card_rec_plain_{key}"
+    with st.container(border=True, key=container_key):
         if icon_type is not None:
-            render_card_header(icon_type, days_until_from_iso(due_iso) if due_iso else None)
+            days_until = days_until_from_iso(due_iso) if due_iso else None
+            dot = category_dot_html(category)
+            badge = urgency_badge_html(days_until) if days_until is not None else ""
+            st.markdown(
+                "<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"margin-bottom:0.3rem;'>{dot}{badge}</div>",
+                unsafe_allow_html=True,
+            )
         cols = st.columns([5, 1.3])
         cols[0].markdown(summary)
         if cols[1].button("Edit", key=key, use_container_width=True):
@@ -693,40 +708,76 @@ render_queued_toast()
 
 
 # ---------- Header ----------
-# Identity fields (name/photo/dob/breed/type) and the profile-level delete both used
-# to be their own tabs. Identity's tab ended up nearly empty once its fields moved
-# into this header, and Delete Profile sitting in the tab strip gave an irreversible,
-# rarely-used action the same visual weight as Health/Personality/Social/Care. Both
-# now live as small icon controls right here instead — one tap from anywhere on the
-# page, no tab spent on either.
-header_cols = st.columns([1, 5, 0.6, 0.6])
-with header_cols[0]:
-    show_photo(profile["photo_path"], responsive=True, max_width=260)
-with header_cols[1]:
-    st.header(profile["name"])
-    if profile["nickname"]:
-        st.caption(f'aka "{profile["nickname"]}"')
-    type_label = "🏠 My Dog" if profile["profile_type"] == "my_dog" else "🌳 Community Dog"
-    st.subheader(type_label)
-    st.write(calc_age_str(profile["dob"], bool(profile["dob_estimated"])))
-    if profile["breed"]:
-        st.write(f"Breed: {profile['breed']}")
-    if profile["profile_type"] == "community_dog" and profile["hangout_location"]:
-        st.write(f"📍 Usually hangs out at: {profile['hangout_location']}")
-    st.caption(f"Added to Pawfolio on {profile['date_added']}")
-    if profile["other_notes"]:
-        with st.expander("📝 Other notes"):
-            st.write(profile["other_notes"])
-with header_cols[2]:
-    if st.button("✏️", key="header_edit", help="Edit identity"):
-        _edit_identity_dialog(profile_id, profile)
-with header_cols[3]:
-    # A popover here left itself visibly open behind the confirm dialog it triggered
-    # (its own open/closed state doesn't auto-close just because a dialog opened on
-    # top of it) — and with a single item in it, the menu wasn't earning its keep
-    # anyway. A plain icon button opens the same confirm dialog with none of that.
-    if st.button("🗑️", key="header_delete", help=f"Delete {profile['name']}'s profile"):
-        _delete_profile_dialog(profile_id, profile["name"])
+# Glass card, same as every other card on the page, with the same avatar+name-row
+# visual language as the dashboard's cards (category dot doesn't apply here -- a
+# dog's own profile isn't itself health/care/social/routine, that classification
+# is for *events*, not profiles -- so render_name_row is called with no category,
+# which simply omits the dot). NOT shrunk to the dashboard cards' literal 40px
+# avatar size: that spec was written for a feed card sitting next to a due-date
+# badge, and a profile's own header is the one place a bigger photo still earns
+# its keep since the whole reason to be on this page is to see this specific dog.
+# See KNOWN_ISSUES.md for this scoping call.
+#
+# Everything else identity-related (full DOB, type, hangout location, notes, date
+# added) lives in its own "Identity" field-group section below instead of in the
+# header, so the header reads as a quick-glance summary rather than a second form.
+# Delete Profile used to be its own tab, giving an irreversible, rarely-used action
+# the same visual weight as Health/Personality/Social/Care — it lives as a small
+# icon control here instead, one tap from anywhere on the page, no tab spent on it.
+with st.container(border=True, key="card_profile_header"):
+    header_cols = st.columns([1, 5, 0.6, 0.6])
+    with header_cols[0]:
+        show_photo(profile["photo_path"], width=88, shape="circle")
+    with header_cols[1]:
+        display_name = profile["name"]
+        if profile["nickname"]:
+            display_name += f' "{profile["nickname"]}"'
+        render_name_row(display_name)
+        meta_bits = []
+        if profile["breed"]:
+            meta_bits.append(profile["breed"])
+        age_str = calc_age_str(profile["dob"], bool(profile["dob_estimated"]))
+        if age_str:
+            meta_bits.append(age_str)
+        if meta_bits:
+            st.caption(" · ".join(meta_bits))
+    with header_cols[2]:
+        if st.button("✏️", key="header_edit", help="Edit identity"):
+            _edit_identity_dialog(profile_id, profile)
+    with header_cols[3]:
+        # A popover here left itself visibly open behind the confirm dialog it triggered
+        # (its own open/closed state doesn't auto-close just because a dialog opened on
+        # top of it) — and with a single item in it, the menu wasn't earning its keep
+        # anyway. A plain icon button opens the same confirm dialog with none of that.
+        if st.button("🗑️", key="header_delete", help=f"Delete {profile['name']}'s profile"):
+            _delete_profile_dialog(profile_id, profile["name"])
+
+# ---------- At-a-glance tag pills ----------
+# Likes/toys/foods/games merged into one scannable row right under the header —
+# deliberately the muted neutral pill style (show_tag_pills), not the bold category
+# colors, since those are reserved for dashboard/due-date status cards, not
+# personality tags. Dislikes/foods-to-avoid are cautionary rather than "favorites,"
+# so they're left out of this summary row and stay in their own labeled section
+# inside the Personality tab below, alongside the full breakdown of every field
+# (including these merged ones) for anyone who wants the complete picture.
+glance_tags = (
+    tags_to_list(profile["likes"]) + tags_to_list(profile["favorite_toys"])
+    + tags_to_list(profile["favorite_foods"]) + tags_to_list(profile["favorite_games"])
+)
+if glance_tags:
+    show_tag_pills(", ".join(glance_tags))
+
+# ---------- Identity ----------
+type_label = "🏠 My Dog" if profile["profile_type"] == "my_dog" else "🌳 Community Dog"
+identity_rows = [("Type", type_label), ("Date of birth", profile["dob"] or None)]
+if profile["dob"] and profile["dob_estimated"]:
+    identity_rows.append(("DOB is estimated", "Yes"))
+if profile["profile_type"] == "community_dog" and profile["hangout_location"]:
+    identity_rows.append(("Usual hangout", profile["hangout_location"]))
+identity_rows.append(("Added to Pawfolio", profile["date_added"]))
+if profile["other_notes"]:
+    identity_rows.append(("Other notes", profile["other_notes"]))
+render_field_group("Identity", identity_rows)
 
 st.divider()
 
@@ -760,12 +811,19 @@ with tab_health:
             "pet program — safe to leave blank otherwise."
         )
         if profile["reg_next_due"]:
-            render_card_header("registration", days_until_from_iso(profile["reg_next_due"]))
-        st.write(
-            f"Registration ID: **{profile['reg_id'] or '—'}** · "
-            f"Last renewed: {profile['reg_last_renewed'] or '—'} · "
-            f"Next due: {profile['reg_next_due'] or '—'}"
-        )
+            days_until = days_until_from_iso(profile["reg_next_due"])
+            reg_dot = category_dot_html(category_for_type("registration"))
+            reg_badge = urgency_badge_html(days_until) if days_until is not None else ""
+            st.markdown(
+                "<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"margin-bottom:0.3rem;'>{reg_dot}{reg_badge}</div>",
+                unsafe_allow_html=True,
+            )
+        render_field_group("Registration", [
+            ("Registration ID", profile["reg_id"]),
+            ("Last renewed", profile["reg_last_renewed"]),
+            ("Next due", profile["reg_next_due"]),
+        ])
         if st.button("✏️ Edit Registration", key="btn_edit_reg", use_container_width=True):
             _edit_registration_dialog(profile_id, profile)
 
@@ -788,8 +846,10 @@ with tab_health:
 
     with st.expander("♻️ Spay / Neuter Status", key="exp_health_spay"):
         status_label = {"unknown": "Unknown", "yes": "Yes", "no": "No"}.get(profile["spay_neuter_status"] or "unknown", "Unknown")
-        date_suffix = f" · Date: {profile['spay_neuter_date']}" if profile["spay_neuter_date"] else ""
-        st.write(f"Status: **{status_label}**{date_suffix}")
+        render_field_group("Spay / Neuter", [
+            ("Status", status_label),
+            ("Date", profile["spay_neuter_date"]),
+        ])
         if st.button("✏️ Edit Spay/Neuter Status", key="btn_edit_spay", use_container_width=True):
             _edit_spay_neuter_dialog(profile_id, profile)
 
@@ -839,7 +899,7 @@ with tab_personality:
 
 # ================= SOCIAL =================
 with tab_social:
-    st.subheader("Friends")
+    st.subheader("Friends", anchor=False)
     friends = get_friends(profile_id, owner_id)
     if not friends:
         st.caption("No friends on record yet.")
@@ -857,7 +917,7 @@ with tab_social:
         _add_friend_dialog(profile_id)
 
     st.divider()
-    st.subheader("Siblings")
+    st.subheader("Siblings", anchor=False)
     siblings = get_siblings(profile_id, owner_id)
     if not siblings:
         st.caption("No siblings linked yet.")

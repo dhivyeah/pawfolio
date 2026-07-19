@@ -22,25 +22,58 @@ def _authed(at, owner_id):
 def test_app_home_loads_without_exception(owner_id):
     at = _authed(AppTest.from_file(_path("app.py")), owner_id).run()
     assert not at.exception
-    assert at.title[0].value == "🐾 Pawfolio"
+    # 2026-07-19: the old page-level "🐾 Pawfolio" st.title() on Home is gone --
+    # the brand mark now lives once, globally, in app.py's top bar as styled
+    # markdown (ui_helpers-style raw HTML via .pf-brand), not a real Streamlit
+    # title element, so it shows up in markdown, not at.title.
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "Pawfolio" in markdown_text
 
 
-def test_top_nav_has_only_home_and_profiles_no_add_profile_button(owner_id):
+def test_top_nav_has_only_home_and_my_pups_no_add_profile_or_logout_button(owner_id):
+    # Home is the default page, so its nav pills render as the "active" segment
+    # (keys "nav_home_full_active"/"nav_home_icon_active" -- see app.py/styles.py's
+    # pill-shaped segmented nav, rendered twice for the icon-only mobile variant)
+    # while My Pups renders as the plain inactive ones. Log out and New Profile
+    # both moved out of the persistent top bar in the 2026-07-19 header
+    # restructure -- log out into the account-menu popover (still findable by
+    # AppTest via its key, since popover content renders regardless of the
+    # frontend's open/closed visual state), New Profile onto the My Pups page.
     at = _authed(AppTest.from_file(_path("app.py")), owner_id).run()
     button_keys = [b.key for b in at.button]
-    assert "nav_home" in button_keys
-    assert "nav_profiles" in button_keys
-    # "New Profile" must not be a persistent nav item — only a button on the Home page itself
+    assert "nav_home_full_active" in button_keys
+    assert "nav_home_icon_active" in button_keys
+    assert "nav_profiles_full" in button_keys
+    assert "nav_profiles_icon" in button_keys
+    assert "account_menu" not in button_keys  # popover trigger has its own key/testid, not a plain button
+    assert "nav_logout" in button_keys  # still reachable, just relocated into the account menu
+    # "New Profile" must not be a persistent nav item — only a button on the My Pups page itself
     assert "nav_add_profile" not in button_keys
+    assert "home_add_profile" not in button_keys
     page_link_labels = [pl.label for pl in at.get("page_link")]
     assert "New Profile" not in page_link_labels
     assert "Profile" not in page_link_labels  # profile detail must not be a nav destination either
 
 
-def test_home_page_has_new_profile_button(owner_id):
+def test_account_menu_shows_profile_counts(owner_id):
+    db.create_profile({
+        "name": "Rex", "photo_path": None, "dob": None, "dob_estimated": 0,
+        "breed": None, "profile_type": "my_dog", "date_added": date.today().isoformat(),
+        "hangout_location": None, "reg_id": None, "reg_last_renewed": None, "reg_next_due": None,
+        "likes": None, "dislikes": None, "favorite_toys": None, "favorite_foods": None,
+        "foods_to_avoid": None, "favorite_games": None,
+    }, owner_id)
+    db.create_profile({
+        "name": "Buddy", "photo_path": None, "dob": None, "dob_estimated": 0,
+        "breed": None, "profile_type": "community_dog", "date_added": date.today().isoformat(),
+        "hangout_location": None, "reg_id": None, "reg_last_renewed": None, "reg_next_due": None,
+        "likes": None, "dislikes": None, "favorite_toys": None, "favorite_foods": None,
+        "foods_to_avoid": None, "favorite_games": None,
+    }, owner_id)
     at = _authed(AppTest.from_file(_path("app.py")), owner_id).run()
-    button_keys = [b.key for b in at.button]
-    assert "home_add_profile" in button_keys
+    assert not at.exception
+    caption_values = [c.value for c in at.caption]
+    assert any("1 pup" in c and "1 community pup" in c for c in caption_values)
 
 
 def test_all_profiles_view_loads_without_exception(owner_id):
@@ -77,8 +110,13 @@ def test_profile_detail_with_selection_shows_profile(owner_id):
     at.session_state["selected_profile_id"] = pid
     at.run()
     assert not at.exception
-    headers = [h.value for h in at.header]
-    assert "Rex" in headers
+    # The profile header lost its plain st.header() in the 2026-07-19 glassmorphism
+    # redesign -- the name now renders via ui_helpers.render_name_row() as styled
+    # raw HTML (matching the dashboard cards' name-row pattern) instead of a
+    # semantic Streamlit heading element, so it shows up in markdown, not at.header.
+    # See KNOWN_ISSUES.md for the accessibility tradeoff this introduces.
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "Rex" in markdown_text
 
 
 def test_home_shows_new_pack_member_card_for_recent_profile(owner_id):

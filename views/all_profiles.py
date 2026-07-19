@@ -2,6 +2,13 @@ import streamlit as st
 from db import get_all_profiles, calc_age_str
 from ui_helpers import show_photo, render_queued_toast
 
+# "My Pups" -- renamed from "All the Pups" 2026-07-19, purely a label change.
+# Still exactly as private as before: every query below is owner_id-scoped,
+# covering only this user's own "my_dog" and "community_dog" profiles, nothing
+# from any other account. This is NOT the future public "All Pups" feature
+# (Phase 5 -- every user's dog names + general location only, no private
+# records, with a "friend" option) -- that's a deliberately separate page with
+# very different data-scoping, not built yet, not this page renamed further.
 owner_id = st.session_state["auth_user"]["user_id"]
 
 # Surfaces the "profile deleted" confirmation queued by profile_detail.py just before
@@ -10,7 +17,7 @@ render_queued_toast()
 
 title_cols = st.columns([4, 1.4])
 with title_cols[0]:
-    st.title("All the Pups")
+    st.title("My Pups", anchor=False)
 with title_cols[1]:
     st.write("")
     if st.button("➕ New Profile", key="all_profiles_add_profile", use_container_width=True):

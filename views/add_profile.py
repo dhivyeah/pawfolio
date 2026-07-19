@@ -5,7 +5,7 @@ from ui_helpers import save_uploaded_photo, queue_toast
 
 owner_id = st.session_state["auth_user"]["user_id"]
 
-st.title("New Profile")
+st.title("New Profile", anchor=False)
 st.caption(
     "Create a profile for one of your own dogs, or a friendly dog from the neighborhood. "
     "Vaccinations, friends, and everything else can be added afterward from the profile page."

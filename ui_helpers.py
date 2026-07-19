@@ -1,6 +1,7 @@
 """Small shared UI utilities used across pages."""
 import os
 import base64
+import html
 from datetime import date, datetime
 import streamlit as st
 from db import get_all_vets, create_vet, link_vet_to_profile, get_vets_for_profile, \
@@ -58,14 +59,17 @@ def show_photo(photo_path: str, width: int = 150, height: int = None, responsive
     if uri:
         st.markdown(
             f"<img src='{uri}' style='{size_style}object-fit:cover;"
-            f"border-radius:{radius};display:block;border:2px solid var(--pf-border, #F0D9C0);' />",
+            f"border-radius:{radius};display:block;border:1px solid rgba(255,255,255,0.7);' />",
             unsafe_allow_html=True,
         )
     else:
+        # rgba(255,255,255,0.75) -- exact avatar background from the glassmorphism
+        # redesign brief, reused here for every placeholder (not just the 40px
+        # dashboard-card avatar) so a missing photo looks consistent everywhere.
         st.markdown(
             f"<div style='{size_style}display:flex;align-items:center;"
-            f"justify-content:center;font-size:{placeholder_font};background:var(--pf-card-bg-alt, #FFEAD8);"
-            f"border-radius:{radius};border:2px solid var(--pf-border, #F0D9C0);'>{PLACEHOLDER_EMOJI}</div>",
+            f"justify-content:center;font-size:{placeholder_font};background:rgba(255,255,255,0.75);"
+            f"border-radius:{radius};border:1px solid rgba(255,255,255,0.7);'>{PLACEHOLDER_EMOJI}</div>",
             unsafe_allow_html=True,
         )
 
@@ -135,39 +139,73 @@ def show_tag_pills(tags_str: str, empty_msg: str = "—"):
     if not tags:
         st.caption(empty_msg)
         return
+    # html.escape() -- tags are free-typed user input rendered via unsafe_allow_html, so an
+    # unescaped "<script>..." or "<img onerror=...>" typed into e.g. "Likes" would render as
+    # live HTML rather than text. Only ever shows the owner their own data today, so this was
+    # self-XSS at worst, not a cross-user attack -- but profile_type already has a
+    # "community_dog" option earmarked for future shared visibility (see KNOWN_ISSUES.md),
+    # at which point unescaped tags would become a real stored-XSS risk against other users.
+    # rgba(255,255,255,0.7) -- exact glass-pill background from the redesign brief,
+    # replacing the old solid-color fill so tags match the frosted card aesthetic.
     pills = " ".join(
-        f"<span style='background:var(--pf-card-bg-alt, #FFEAD8);color:var(--pf-text, #4A3225);"
-        f"padding:4px 12px;border-radius:999px;border:1.5px solid var(--pf-border, #F0D9C0);"
-        f"font-size:0.85em;margin:3px;display:inline-block;'>{t}</span>"
+        f"<span style='background:rgba(255,255,255,0.7);color:var(--pf-text, #4A3225);"
+        f"padding:4px 12px;border-radius:999px;border:1px solid rgba(255,255,255,0.8);"
+        f"font-size:0.85em;margin:3px;display:inline-block;'>{html.escape(t)}</span>"
         for t in tags
     )
     st.markdown(pills, unsafe_allow_html=True)
 
 
-# ---------- Icon circles + urgency badges (dashboard cards, profile due-date rows) ----------
-# One shared source of truth for "what icon/color represents this kind of thing" so the
+# ---------- Category dots + urgency badges (dashboard cards, profile due-date rows) ----------
+# One shared source of truth for "what category does this kind of thing belong to" so the
 # dashboard grid and the profile page's due-date rows can't visually drift apart from each
-# other over time. Icons are Font Awesome Free glyphs loaded via CDN (styles.py) rather than
-# emoji, per an explicit choice to prioritize a sharper "app-like" look here over this
-# codebase's usual no-external-dependency default (inline SVG mascot, base64-embedded
-# photos) -- see KNOWN_ISSUES.md for the tradeoff this brings (unverified in a real browser,
-# no fallback if the CDN is ever blocked).
-# Third element is the icon glyph's own color. Fixed near-white (#FFFBF5) works for every
-# background here except --pf-accent (gold) -- it stays light-toned in both light *and*
-# dark mode (see styles.py), so white-on-gold reads as low-contrast in both, not just one.
-# food_refill gets a fixed dark color instead, the one case that needs it.
-_TYPE_ICON = {
-    "vaccination": ("fa-syringe", "var(--pf-primary)", "#FFFBF5"),
-    "medication": ("fa-pills", "var(--pf-pink)", "#FFFBF5"),
-    "bath": ("fa-droplet", "var(--pf-blue)", "#FFFBF5"),
-    "food_refill": ("fa-bowl-food", "var(--pf-accent)", "#4A3225"),
-    "own_birthday": ("fa-cake-candles", "var(--pf-lavender)", "#FFFBF5"),
-    "friend_birthday": ("fa-cake-candles", "var(--pf-lavender)", "#FFFBF5"),
-    "registration": ("fa-file-lines", "var(--pf-secondary)", "#FFFBF5"),
-    "boarding_checkin": ("fa-suitcase-rolling", "var(--pf-primary-hover)", "#FFFBF5"),
-    "new_profile": ("fa-paw", "var(--pf-pink)", "#FFFBF5"),
+# other. The 2026-07-19 glassmorphism redesign is explicit that color appears ONLY as a small
+# dot next to a name (never a full-card fill, and no more per-type icon circles/Font Awesome --
+# both retired this pass in favor of the dot). registration doesn't cleanly fit any of the
+# four given categories (it's bureaucratic paperwork, not a health/care/social event) -- filed
+# under "routine" rather than "health" since it's closer to a logistics chore than a medical
+# one; see KNOWN_ISSUES.md for this call, carried over unchanged from the previous pass.
+_CATEGORY_BY_TYPE = {
+    "vaccination": "health",
+    "medication": "health",
+    "bath": "care",
+    "food_refill": "care",
+    "boarding_checkin": "care",
+    "own_birthday": "social",
+    "friend_birthday": "social",
+    "new_profile": "social",
+    "registration": "routine",
 }
-_DEFAULT_ICON = ("fa-paw", "var(--pf-text-muted)", "#FFFBF5")
+_DEFAULT_CATEGORY = "routine"
+
+# health & routine (logistics-ish) get the amber/orange half of the palette, care & social
+# get the teal half, per the redesign brief's own example grouping.
+_CATEGORY_DOT_COLOR = {
+    "health": "#ff9f4a",    # warm orange
+    "routine": "#ffc93c",   # amber/yellow
+    "care": "#1fb8b0",      # bright teal
+    "social": "#0e7c78",    # deep teal
+}
+
+
+def category_for_type(item_type: str) -> str:
+    """Which of the 4 card categories (health/care/social/routine) an item type
+    belongs to -- the single source of truth for a card's small category dot
+    color (styles.py's --pf-dot-* vars mirror the same 4 values)."""
+    return _CATEGORY_BY_TYPE.get(item_type, _DEFAULT_CATEGORY)
+
+
+def category_dot_html(category: str, size: int = 7) -> str:
+    """The one place color signals category in this design -- a small solid dot,
+    never a card fill. Returns '' for an unrecognized/None category (e.g. "New
+    Pack Members" cards, which have no category concept) rather than guessing."""
+    color = _CATEGORY_DOT_COLOR.get(category)
+    if not color:
+        return ""
+    return (
+        f"<span style='width:{size}px;height:{size}px;border-radius:50%;"
+        f"background:{color};display:inline-block;flex-shrink:0;'></span>"
+    )
 
 
 def days_until_from_iso(iso_date: str):
@@ -182,16 +220,6 @@ def days_until_from_iso(iso_date: str):
     except ValueError:
         return None
     return (d - date.today()).days
-
-
-def icon_circle_html(item_type: str, size: int = 40) -> str:
-    icon_class, bg, icon_color = _TYPE_ICON.get(item_type, _DEFAULT_ICON)
-    font_size = round(size * 0.42)
-    return (
-        f"<div style='width:{size}px;height:{size}px;border-radius:50%;background:{bg};"
-        f"display:flex;align-items:center;justify-content:center;flex-shrink:0;'>"
-        f"<i class='fa-solid {icon_class}' style='color:{icon_color};font-size:{font_size}px;'></i></div>"
-    )
 
 
 def urgency_tier(days_until: int) -> str:
@@ -210,13 +238,14 @@ def urgency_tier(days_until: int) -> str:
 
 
 def urgency_badge_html(days_until: int) -> str:
-    """Color intensity steps down as urgency drops: overdue/due-soon are the most
-    saturated (danger red / brand orange), "this week" is medium (gold), and routine
-    items are deliberately calm and muted -- low-contrast on purpose, so a screen full
-    of upcoming items doesn't read as uniformly alarming."""
+    """Exact glass-badge values from the redesign brief: semi-transparent white,
+    fully rounded, small. Urgency is communicated by the label wording (and a
+    slightly bolder weight for the two most time-sensitive tiers), not a second
+    color -- color on this app's cards is reserved entirely for the small
+    category dot (category_dot_html above)."""
     tier = urgency_tier(days_until)
     if tier == "overdue":
-        label, bg, color, border = f"{abs(days_until)}d overdue", "var(--pf-danger)", "#FFFBF5", "transparent"
+        label = f"{abs(days_until)}d overdue"
     elif tier == "soon":
         if days_until == 0:
             label = "Due today"
@@ -224,30 +253,90 @@ def urgency_badge_html(days_until: int) -> str:
             label = "Due tomorrow"
         else:
             label = f"Due in {days_until}d"
-        bg, color, border = "var(--pf-primary)", "#FFFBF5", "transparent"
     elif tier == "week":
-        # Fixed dark text, not var(--pf-text) -- --pf-accent (gold) stays light-toned in
-        # both light *and* dark mode (see styles.py), so the theme-flipping text color
-        # would go light-on-light in dark mode instead of tracking the background.
-        label, bg, color, border = "This week", "var(--pf-accent)", "#4A3225", "transparent"
+        label = "This week"
     else:
-        label, bg, color, border = "Routine", "var(--pf-card-bg-alt)", "var(--pf-text-muted)", "var(--pf-border)"
+        label = "Routine"
+    weight = 700 if tier in ("overdue", "soon") else 600
     return (
-        f"<span style='background:{bg};color:{color};padding:4px 12px;border-radius:999px;"
-        f"font-size:0.78em;font-weight:700;white-space:nowrap;border:1.5px solid {border};'>{label}</span>"
+        "<span style='background:rgba(255,255,255,0.8);color:#2c2a22;padding:3px 10px;"
+        f"border-radius:999px;font-size:11px;font-weight:{weight};white-space:nowrap;'>{label}</span>"
     )
 
 
-def render_card_header(item_type: str, days_until: int = None):
-    """Icon circle top-left + (if days_until is given) urgency badge top-right, as one
-    row. days_until=None renders just the icon circle alone (e.g. 'New Pack Members'
-    cards, which have no due date/urgency concept at all)."""
-    badge = urgency_badge_html(days_until) if days_until is not None else ""
+def render_urgency_badge(days_until: int):
+    """Just the urgency badge, right-aligned -- used on the profile page's
+    due-date rows, which (unlike dashboard cards) have no pet avatar/name-row of
+    their own to attach the badge to."""
     st.markdown(
-        "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;'>"
-        + icon_circle_html(item_type) + badge + "</div>",
+        f"<div style='display:flex;justify-content:flex-end;'>{urgency_badge_html(days_until)}</div>",
         unsafe_allow_html=True,
     )
+
+
+def render_name_row(name: str, category: str = None, days_until: int = None):
+    """Top row of a glass card's content area: a small category dot + the name in
+    bold (left), the urgency badge (right, if a due date applies). Exactly the
+    'name appears once' header -- callers must NOT also prefix the message text
+    below it with the name (see render_avatar_card_link). html.escape() on name
+    since it's free-typed profile-name text going into raw HTML."""
+    dot = category_dot_html(category) if category else ""
+    badge = urgency_badge_html(days_until) if days_until is not None else ""
+    st.markdown(
+        "<div style='display:flex;justify-content:space-between;align-items:center;gap:8px;'>"
+        f"<div style='display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;'>{dot}"
+        f"<span style='font-weight:700;font-size:14px;color:#2c2a22;white-space:nowrap;"
+        f"overflow:hidden;text-overflow:ellipsis;'>{html.escape(name)}</span></div>"
+        f"{badge}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_avatar_card_link(photo_path, name: str, message: str, profile_id, key: str,
+                             category: str = None, days_until: int = None, photo_size: int = 40):
+    """One dashboard card's full clickable content: a 40px circular avatar, then a
+    content column with the name-row (category dot + bold name + urgency badge,
+    see render_name_row) on top and the message below it. The avatar AND the name
+    are the *only* way to reach the profile from here (no separate 'View profile'
+    button anywhere) -- Streamlit buttons can't wrap an image/markdown block
+    directly, so the click target is a same-sized transparent button layered on
+    top of a position:relative wrapper instead (styles.py's pf_photolink_ rules).
+
+    `message` must NOT repeat `name` -- voice.py's templates already say e.g.
+    "Bobby checks into..." on their own, so the name-row above is the only place
+    the name is meant to appear as a standalone heading; this function renders
+    `message` through plain st.markdown (no unsafe_allow_html, Streamlit's default
+    escaping already covers any free-typed text embedded in it) exactly as given,
+    with no name prefix added here."""
+    with st.container(key=f"pf_photolink_wrap_{key}"):
+        cols = st.columns([1, 6])
+        with cols[0]:
+            show_photo(photo_path, width=photo_size, height=photo_size, shape="circle")
+        with cols[1]:
+            render_name_row(name, category, days_until)
+            st.markdown(message)
+        if st.button(" ", key=f"pf_photolink_btn_{key}", help="View profile"):
+            st.session_state["selected_profile_id"] = profile_id
+            st.switch_page("views/profile_detail.py")
+
+
+def render_field_group(title: str, rows: list):
+    """A labeled section of label-left/value-right rows with a subtle divider between
+    them -- used for flat profile properties (Identity, Registration, Spay/Neuter)
+    instead of a plain stacked st.write() list. The group itself gets the same glass
+    card treatment as every other card (styles.py's .pf-field-group rule); no
+    category dot here, since a flat property group has no category/urgency concept.
+    `rows` is a list of (label, value) pairs; a falsy value renders as an em dash.
+    html.escape() on both since some values (breed, notes, hangout location) are
+    free-typed user input rendered via unsafe_allow_html -- same reasoning as
+    show_tag_pills."""
+    row_html = "".join(
+        f"<div class='pf-field-row'><span class='pf-field-label'>{html.escape(str(label))}</span>"
+        f"<span class='pf-field-value'>{html.escape(str(value)) if value else '—'}</span></div>"
+        for label, value in rows
+    )
+    st.markdown(f"<div class='pf-field-group-title'>{html.escape(title)}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='pf-field-group'>{row_html}</div>", unsafe_allow_html=True)
 
 
 _ADD_NEW_VET_OPTION = "➕ Add a new vet..."

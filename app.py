@@ -1,6 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
-from db import init_db, PawfolioDBError
+from db import init_db, get_all_profiles, PawfolioDBError
 from styles import inject_theme
 from notifications import check_and_notify
 from login_ui import render_login_signup, render_password_reset
@@ -89,32 +89,106 @@ try:
         st.session_state["_notify_checked"] = True
 
     home_page = st.Page("views/home.py", title="Home", icon="🏠", default=True)
-    all_profiles_page = st.Page("views/all_profiles.py", title="All the Pups", icon="🐾")
+    # Renamed "All the Pups" -> "My Pups" (2026-07-19) -- still exactly the same page,
+    # same owner_id-scoped query, same both-profile-types visibility. This is NOT the
+    # future public "All Pups" feature (Phase 5: every user's dog names + general
+    # location only, no private records, with a "friend" option) -- that's intentionally
+    # not built yet. When it is, it belongs as its own new st.Page here, separate from
+    # this one, since the two need very different data-scoping (this page stays
+    # owner-private; that one would deliberately cross owners for name/location only).
+    my_pups_page = st.Page("views/all_profiles.py", title="My Pups", icon="🐾")
     add_profile_page = st.Page("views/add_profile.py", title="New Profile", icon="➕")
     profile_detail_page = st.Page("views/profile_detail.py", title="Profile", icon="🐶")
 
     pg = st.navigation(
-        [home_page, all_profiles_page, add_profile_page, profile_detail_page],
+        [home_page, my_pups_page, add_profile_page, profile_detail_page],
         position="hidden",
     )
 
-    # Top icon nav: Home, All the Pups, and (right-aligned) log out. "New Profile" lives
-    # as a button on the Home dashboard instead of the nav, and Profile Detail is only
-    # reached by clicking a dog — neither belongs in this bar.
+    # Top bar: compact brand mark (left), Home/My Pups as a pill-shaped segmented
+    # control (center), and a single hamburger/account menu (right) -- log out and
+    # "New Profile" both used to live directly in this bar/on the Home page; both
+    # moved out (log out into the account menu below, New Profile onto the My Pups
+    # page itself, where adding a profile is actually contextually relevant) so this
+    # bar only ever holds primary navigation, not page-specific or account-level
+    # actions. Which nav segment is "active" isn't something Streamlit's own
+    # st.button tracks, so it's expressed by swapping in a differently-keyed button
+    # (styles.py styles "_active" as the filled segment) based on which page
+    # st.navigation() actually picked for this run.
+    #
+    # Each nav segment is rendered *twice* -- an icon+text "_full" button and an
+    # icon-only "_icon" button -- with CSS (styles.py) showing only one at a time
+    # based on viewport width. Streamlit can't swap a button's own label by media
+    # query, so both exist and the hidden one just never gets a chance to be
+    # clicked; this is what stops "Home"/"My Pups" from wrapping to two lines on a
+    # phone-width screen instead of collapsing to icon-only.
+    #
+    # All 4 nav buttons are direct children of the nav_pills container -- NOT
+    # nested inside a second st.columns() split (an earlier version did that, and
+    # the extra column layer was the actual cause of one segment rendering outside
+    # the pill unstyled on mobile -- see KNOWN_ISSUES.md history). With no nested
+    # columns inside nav_pills, there's no risk of that recurring.
+    is_home_active = pg is home_page
+    is_my_pups_active = pg is my_pups_page
     with st.container(key="top_nav"):
-        nav_cols = st.columns([1, 1, 11, 2])
-        with nav_cols[0]:
-            if st.button("🏠", key="nav_home", help="Home"):
-                st.switch_page(home_page)
-        with nav_cols[1]:
-            if st.button("🐾🐾", key="nav_profiles", help="All the Pups"):
-                st.switch_page(all_profiles_page)
-        with nav_cols[3]:
-            if st.button("🚪 Log out", key="nav_logout", help=f"Logged in as {user_email}"):
-                auth.sign_out()
-                for key in ("auth_user", "_notify_checked"):
-                    st.session_state.pop(key, None)
-                st.rerun()
+        header_cols = st.columns([2.4, 6.2, 1.4])
+        with header_cols[0]:
+            # Compact brand mark -- icon-only on mobile (CSS hides the text span
+            # below the same 640px breakpoint the nav pills use), icon+text on
+            # desktop. Replaces the old large hero title that used to live on the
+            # Home page itself; showing it once, globally, here, means Home no
+            # longer needs to repeat it as its own page header.
+            st.markdown(
+                "<div class='pf-brand'><span class='pf-brand-icon'>🐾</span>"
+                "<span class='pf-brand-text'>Pawfolio</span></div>",
+                unsafe_allow_html=True,
+            )
+        with header_cols[1]:
+            with st.container(key="nav_pills"):
+                home_clicked = st.button(
+                    "🏠 Home", key="nav_home_full_active" if is_home_active else "nav_home_full"
+                )
+                home_icon_clicked = st.button(
+                    "🏠", key="nav_home_icon_active" if is_home_active else "nav_home_icon", help="Home"
+                )
+                pups_clicked = st.button(
+                    "🐾 My Pups", key="nav_profiles_full_active" if is_my_pups_active else "nav_profiles_full"
+                )
+                pups_icon_clicked = st.button(
+                    "🐾", key="nav_profiles_icon_active" if is_my_pups_active else "nav_profiles_icon",
+                    help="My Pups",
+                )
+                if home_clicked or home_icon_clicked:
+                    st.switch_page(home_page)
+                if pups_clicked or pups_icon_clicked:
+                    st.switch_page(my_pups_page)
+        with header_cols[2]:
+            # Account menu: a single hamburger icon opening a small popover with an
+            # account-level summary and log out -- the only account-level actions
+            # in the app, deliberately separated from the primary Home/My Pups
+            # navigation next to it. st.popover() is the closest native Streamlit
+            # primitive to a dropdown/slide-out menu; see KNOWN_ISSUES.md for how
+            # it behaves here specifically (it's a real click-to-open floating
+            # panel, not a custom-animated drawer -- Streamlit has no such
+            # component to reach for).
+            with st.popover("☰", key="account_menu", help=f"Logged in as {user_email}"):
+                my_dog_count = len(get_all_profiles(owner_id, profile_type="my_dog"))
+                community_count = len(get_all_profiles(owner_id, profile_type="community_dog"))
+                st.caption(
+                    f"{my_dog_count} pup{'s' if my_dog_count != 1 else ''} · "
+                    f"{community_count} community pup{'s' if community_count != 1 else ''}"
+                )
+                st.divider()
+                if st.button("🚪 Log out", key="nav_logout", use_container_width=True):
+                    auth.sign_out()
+                    # _toast_queue also cleared here -- otherwise a toast queued by this user's
+                    # last action (e.g. "Dr. Rao set as primary vet") can survive the logout and
+                    # fire for whoever logs in next on this same browser session, leaking a
+                    # fragment of this user's data to them. See KNOWN_ISSUES.md, "toast-queue
+                    # leak across logout" -- confirmed via direct reproduction, not theoretical.
+                    for key in ("auth_user", "_notify_checked", "_toast_queue"):
+                        st.session_state.pop(key, None)
+                    st.rerun()
 
     st.divider()
 

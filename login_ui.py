@@ -19,7 +19,7 @@ def render_login_signup():
             unsafe_allow_html=True,
         )
     with header_cols[1]:
-        st.title("Pawfolio")
+        st.title("Pawfolio", anchor=False)
         st.caption("The feed, but it's just dogs. Sign in to see yours.")
 
     st.divider()
@@ -97,8 +97,8 @@ def render_password_reset(access_token: str, refresh_token: str):
     password happen together in auth.complete_password_reset -- there's no separate "verify"
     step to keep the user logged in through, and this app has no other reason to hold a
     recovery session open."""
-    st.title("🐾 Pawfolio")
-    st.subheader("Set a new password")
+    st.title("🐾 Pawfolio", anchor=False)
+    st.subheader("Set a new password", anchor=False)
 
     # st.query_params.clear() triggers its own rerun, so the success message can't be shown
     # in the same pass that clears it -- a session_state flag lets the "done" state survive
